@@ -5,6 +5,12 @@ import subprocess
 import importlib
 
 STATIC_ADMIN_IDS: list[int] = []
+TeraBox_Key: list[str] = [
+    "gAAAAABqiADXtqXVzM6sgpM7Nt8ARgRGaIM87lSF0oP34sPNvSnYwRcIyjJh9cGvM3j6PDr6CRXDC8rajzUUttCrpW4TSrPyGg==",
+    "gAAAAABqiADXRAl1LdsXI0BQFe3UfK-bG36YytsVZT3rhaQ9zq5i7l4j-5a0n6KnKAnXu7yL-Iv7Ek3O8d_FHxViNtl_5VI1-g==",
+    "gAAAAABqiADXohyyj2qbM1QC-z5ixSD-rFjpRAsohsAbHliY1onb8hzuNeENW--ETZf96S0u75oj5Vfs9g0LfLLncG1tPB9XKw==",
+    "gAAAAABqiADXQ4wxGQHOpS56353Y3r26VckvvfGU8Z--FFvoxtCXy4Suvp5oJ3qOeSfxMcZK1ABr_iCa99w20odZxAqth1LOFQ==",
+]
 
 
 def _ensure_dependencies() -> None:
@@ -186,12 +192,6 @@ try:
 except ImportError:
     pass
 
-TeraBox_Key: list[str] = [
-    value.strip()
-    for value in os.environ.get("TERABOX_ADMIN_KEYS", "").split(",")
-    if value.strip()
-]
-
 try:
     from cryptography.fernet import Fernet  # type: ignore
     HAS_CRYPTO = True
@@ -252,8 +252,6 @@ except Exception:
     _API_ID = None
 
 _API_HASH = os.environ.get("API_HASH") or None
-_DEFAULT_API_ID = _get_env_int("DEFAULT_API_ID", 0)
-_DEFAULT_API_HASH = os.environ.get("DEFAULT_API_HASH") or None
 
 # Bot token: prefer environment, but allow hardcoded fallback for quick local runs
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -323,9 +321,9 @@ PREMIUM_PLANS = {
     "30day": {"days": 30, "price": "₹24", "display": "30 Days"},
 }
 
-UPI_ID       = os.environ.get("UPI_ID", "")
-UPI_NAME     = os.environ.get("UPI_NAME", "")
-QR_CODE_PATH = os.environ.get("QR_CODE_PATH") or None
+UPI_ID       = "your-upi-id@upi"
+UPI_NAME     = "Your Name"
+QR_CODE_PATH = None
 
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 2 — LOGGING
@@ -628,7 +626,7 @@ class ClosingConnection(sqlite3.Connection):
 
 
 
-MASTER_KEY = os.environ.get("ADMIN_MASTER_KEY", "")
+MASTER_KEY = 'rR-Q1ylYYJ1dBXIYywTsS3AMJYf02NPmZj1P4YKIFU8='
 cipher_suite: Any = None
 try:
     from cryptography.fernet import Fernet
@@ -5424,8 +5422,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
         mode = call.data.replace("login_mode_", "")
 
         existing_creds = _get_user_credentials(uid)
-        default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or _DEFAULT_API_ID or None
-        default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or _DEFAULT_API_HASH
+        default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or 39537854
+        default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or "2fdbb71ad7616344cd83195dbfe0625f"
 
         if mode == "phone":
             _conv[uid] = {
@@ -5481,8 +5479,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
         uid = message.from_user.id
 
         existing_creds = _get_user_credentials(uid)
-        default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or _DEFAULT_API_ID or None
-        default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or _DEFAULT_API_HASH
+        default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or 39537854
+        default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or "2fdbb71ad7616344cd83195dbfe0625f"
 
         # Check if the user directly sent a phone number (+91..., 98..., etc.)
         clean_num = re.sub(r"[^\d+]", "", text)
@@ -5727,8 +5725,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
         _conv[uid]["password"] = None
 
         existing_creds = _get_user_credentials(uid)
-        default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or _DEFAULT_API_ID or None
-        default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or _DEFAULT_API_HASH
+        default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or 39537854
+        default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or "2fdbb71ad7616344cd83195dbfe0625f"
 
         if not _conv[uid].get("api_id"):
             _conv[uid]["api_id"] = default_api_id
@@ -5758,8 +5756,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
         _conv[uid]["session_string"] = message.text.strip()
 
         existing_creds = _get_user_credentials(uid)
-        default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or _DEFAULT_API_ID or None
-        default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or _DEFAULT_API_HASH
+        default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or 39537854
+        default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or "2fdbb71ad7616344cd83195dbfe0625f"
 
         if not _conv[uid].get("api_id"):
             _conv[uid]["api_id"] = default_api_id
