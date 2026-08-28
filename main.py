@@ -5488,13 +5488,28 @@ def register_handlers(b: telebot.TeleBot) -> None:
 
     def _login_choose_method(message):
         if _is_cancel(message): return _cancel_conv(b, message)
-        text = message.text.strip()
+        text = (message.text or "").strip()
         text_lower = text.lower()
         uid = message.from_user.id
+
+        # A selected StringSession flow must not be reclassified as a phone number.
+        if _conv.get(uid, {}).get("mode") == "login_string":
+            _login_got_session_string(message)
+            return
 
         existing_creds = _get_user_credentials(uid)
         default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or 39537854
         default_api_hash = _API_HASH or (existing_creds[1] if existing_creds else None) or "2fdbb71ad7616344cd83195dbfe0625f"
+
+        # Check if the user directly sent a session string
+        if len(text) > 100 and not text.startswith("/"):
+            _conv[uid] = {
+                "mode": "login_string",
+                "api_id": default_api_id,
+                "api_hash": default_api_hash
+            }
+            _login_got_session_string(message)
+            return
 
         # Check if the user directly sent a phone number (+91..., 98..., etc.)
         clean_num = re.sub(r"[^\d+]", "", text)
@@ -5505,16 +5520,6 @@ def register_handlers(b: telebot.TeleBot) -> None:
                 "api_hash": default_api_hash
             }
             _login_got_phone(message)
-            return
-
-        # Check if the user directly sent a session string
-        if len(text) > 100 and not text.startswith("/"):
-            _conv[uid] = {
-                "mode": "login_string",
-                "api_id": default_api_id,
-                "api_hash": default_api_hash
-            }
-            _login_got_session_string(message)
             return
 
         # Option 1: Phone number (Quick OTP)
