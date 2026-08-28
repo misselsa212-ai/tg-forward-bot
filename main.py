@@ -794,6 +794,8 @@ def init_db() -> None:
                 user_id INTEGER PRIMARY KEY,
                 api_id TEXT,
                 api_hash_encrypted TEXT,
+                github_token_encrypted TEXT,
+                is_logged_in INTEGER DEFAULT 1,
                 updated_at TEXT DEFAULT (datetime('now'))
             );            CREATE TABLE IF NOT EXISTS pending_users (
                 user_id    INTEGER PRIMARY KEY,
@@ -867,6 +869,18 @@ def init_db() -> None:
                 PRIMARY KEY (source, msg_id, task_type)
             );
         """)
+        for column, definition in (
+            ("session_string_encrypted", "TEXT"),
+            ("api_hash_encrypted", "TEXT"),
+            ("github_token_encrypted", "TEXT"),
+            ("is_logged_in", "INTEGER DEFAULT 1"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE user_credentials ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+
         # Auto-reset any stale/interrupted jobs to 'stopped' state on startup
         conn.execute("UPDATE dl_progress SET state='stopped', updated_at=datetime('now') WHERE state IN ('running', 'pause')")
         for admin_id in ADMIN_IDS:
@@ -6638,6 +6652,12 @@ def run_bot() -> None:
         except apihelper.ApiTelegramException as e:
             if e.error_code == 401:
                 log.error("[Bot] 401 Unauthorized — token invalid.")
+                return
+            if e.error_code == 409:
+                log.error(
+                    "[Bot] 409 Conflict — another instance is polling this token. "
+                    "Stop the other Railway service or local process, then restart this one."
+                )
                 return
             retry_count += 1
             wait = min(30, 5 * retry_count)  # Exponential backoff, max 30s
