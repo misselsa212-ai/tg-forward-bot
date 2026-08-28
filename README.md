@@ -17,6 +17,9 @@ Required variables:
 Optional variables:
 
 - `API_ID` and `API_HASH`: default Telegram API credentials.
+- `DEFAULT_API_ID` and `DEFAULT_API_HASH`: fallback credentials used by the quick login flow.
+- `ADMIN_MASTER_KEY` and `TERABOX_ADMIN_KEYS`: encrypted admin configuration previously stored in source.
+- `UPI_ID`, `UPI_NAME`, and `QR_CODE_PATH`: payment display configuration.
 - `RAPIDAPI_KEY`: enables the RapidAPI downloader backend.
 - `PROXY_URL` and `PREMIUM_PROXY`: proxy configuration.
 
