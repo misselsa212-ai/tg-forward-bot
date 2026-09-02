@@ -5285,6 +5285,46 @@ def register_handlers(b: telebot.TeleBot) -> None:
             pass
         b.send_message(message.chat.id, text, parse_mode="HTML")
 
+    @b.message_handler(commands=["reset_forward", "resetfwd", "reset"])
+    def cmd_reset_forward(message):
+        if not _is_lx_auth(message.from_user.id):
+            return b.reply_to(message, "⛔ Admin only.")
+
+        parts = message.text.split()
+        if len(parts) < 2:
+            return b.reply_to(
+                message,
+                "ℹ️ <b>Usage:</b> <code>/reset_forward &lt;source_channel&gt;</code>\n\n"
+                "Clears the saved forward history for that source so the next "
+                "<code>/forward</code> can send its posts again.\n"
+                "Example: <code>/reset_forward @my_source_channel</code>",
+                parse_mode="HTML",
+            )
+
+        src = parts[1]
+        try:
+            with _db_lock, get_db() as conn:
+                cur = conn.execute(
+                    "DELETE FROM processed_messages WHERE source=? AND task_type LIKE 'forward%'",
+                    (str(src),),
+                )
+                removed = cur.rowcount or 0
+                conn.execute(
+                    "DELETE FROM dl_progress WHERE src=? AND job_id LIKE 'fwd_%'",
+                    (str(src),),
+                )
+        except Exception as e:
+            return b.reply_to(message, f"❌ Reset failed: <code>{_esc(str(e))}</code>", parse_mode="HTML")
+
+        b.reply_to(
+            message,
+            f"🧹 <b>Forward history cleared</b> for <code>{_esc(src)}</code>.\n"
+            f"🗑 Removed <code>{removed}</code> processed-message record(s).\n\n"
+            f"Next <code>/forward</code> from this source starts fresh — at the resume step "
+            f"send <code>0</code> to begin from the first message.",
+            parse_mode="HTML",
+        )
+
     @b.message_handler(commands=["skipfwd", "skip"])
     def cmd_skip_fwd(message):
         if not _is_lx_auth(message.from_user.id):
@@ -6108,7 +6148,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
         msg = b.send_message(
             message.chat.id,
             "Step 4 / 5 — <b>Resume point</b>\n\n"
-            "Send the <b>last forwarded Msg ID</b> (e.g. <code>27078</code>) to continue right after it.\n"
+            "Send the <b>last forwarded Msg ID</b> (e.g. <code>27078</code>) to continue right after it. "
+            "Everything after that ID is re-sent even if an earlier run already forwarded it.\n\n"
             "Send <code>0</code> or <code>skip</code> to use the saved checkpoint, "
             "or start from the first message if there is none.\n\n"
             "<i>Tip: the previous run's status / completion message shows 🔖 Last msg ID.</i>",
@@ -8007,8 +8048,14 @@ async def _forwarder_task(
                 dl_job_update(job_id, sent, failed + dl_errors, last_id or msg.id, "stopped", "stopped")
                 break
 
-            if is_msg_processed(src, msg.id, task_scope) or is_msg_processed(src, msg.id, "forward"):
-                skipped += 1; continue
+            # An explicit resume ID is the user overriding history: forward
+            # everything after it, even if a previous run marked it processed.
+            if not start_after and (is_msg_processed(src, msg.id, task_scope)
+                                    or is_msg_processed(src, msg.id, "forward")):
+                if pending:
+                    await _handle(pending); pending = []; pending_gid = None
+                skipped += 1
+                continue
 
             gid = getattr(msg, "grouped_id", None)
             if pending and (gid is None or gid != pending_gid):
