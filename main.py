@@ -6051,7 +6051,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "🔁 <b>Media Forwarder Setup</b>\n\n"
             "Direction: <b>NEW channel → OLD channel</b>\n"
             "(Media from NEW is uploaded into OLD)\n\n"
-            "Step 1 / 4 — <b>SOURCE (NEW channel)</b>:\n" + _channel_hint(message.chat.id) +
+            "Step 1 / 5 — <b>SOURCE (NEW channel)</b>:\n" + _channel_hint(message.chat.id) +
             "\n\n<i>Send /cancel to abort.</i>",
             parse_mode="HTML",
         )
@@ -6065,7 +6065,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
         _conv[uid]["src_label"] = label
         msg = b.send_message(
             message.chat.id,
-            "Step 2 / 4 — <b>DESTINATION (OLD channel)</b>:\n" + _channel_hint(message.chat.id),
+            "Step 2 / 5 — <b>DESTINATION (OLD channel)</b>:\n" + _channel_hint(message.chat.id),
             parse_mode="HTML",
         )
         b.register_next_step_handler(msg, _fwd_got_dst)
@@ -6078,7 +6078,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
         _conv[uid]["dst_label"] = label
         msg = b.send_message(
             message.chat.id,
-            "Step 3 / 4 — How many messages to scan?\n"
+            "Step 3 / 5 — How many messages to scan?\n"
             "Send <code>0</code> or <code>all</code> for unlimited:",
             parse_mode="HTML",
         )
@@ -6105,7 +6105,40 @@ def register_handlers(b: telebot.TeleBot) -> None:
             )
             b.register_next_step_handler(msg, _fwd_got_limit)
             return
-        b.send_message(message.chat.id, "Step 4 / 4 — What to forward?",
+        msg = b.send_message(
+            message.chat.id,
+            "Step 4 / 5 — <b>Resume point</b>\n\n"
+            "Send the <b>last forwarded Msg ID</b> (e.g. <code>27078</code>) to continue right after it.\n"
+            "Send <code>0</code> or <code>skip</code> to use the saved checkpoint, "
+            "or start from the first message if there is none.\n\n"
+            "<i>Tip: the previous run's status / completion message shows 🔖 Last msg ID.</i>",
+            parse_mode="HTML",
+        )
+        b.register_next_step_handler(msg, _fwd_got_start_id)
+
+    def _fwd_got_start_id(message):
+        uid = message.from_user.id
+        if _is_cancel(message): return _cancel_conv(b, message)
+        state = _conv.get(uid)
+        if not state or state.get("mode") != "forward":
+            b.send_message(message.chat.id, "This forward session expired. Send /forward to start again.")
+            return
+
+        txt = (message.text or "").strip().lower()
+        m = re.search(r"(\d+)\s*/?\s*$", txt)   # accepts "27078", "#27078", "https://t.me/c/…/27078"
+        if txt in ("", "0", "skip", "no", "none", "auto"):
+            state["start_after"] = 0
+        elif m:
+            state["start_after"] = int(m.group(1))
+        else:
+            msg = b.send_message(
+                message.chat.id,
+                "Please send a message ID (a number), or <code>0</code> / <code>skip</code>:",
+                parse_mode="HTML",
+            )
+            b.register_next_step_handler(msg, _fwd_got_start_id)
+            return
+        b.send_message(message.chat.id, "Step 5 / 5 — What to forward?",
                        reply_markup=_media_type_kb("ft"))
 
     @b.callback_query_handler(func=lambda c: c.data.startswith("ft_"))
@@ -6156,7 +6189,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
             f"🎬 Videos: {'✅' if state['fwd_video'] else '❌'}\n"
             f"🎵 Audio:  {'✅' if state['fwd_audio'] else '❌'}  "
             f"📄 Docs:   {'✅' if state['fwd_doc'] else '❌'}\n"
-            f"📝 Captions: <code>{_esc(state['cap_mode'])}</code>\n\n"
+            f"📝 Captions: <code>{_esc(state['cap_mode'])}</code>\n"
+            f"🔖 Resume after: <code>{state.get('start_after') or 'auto (checkpoint / first message)'}</code>\n\n"
             "Use /pause (ps) /resume (rm) /stop (so) to control."
         )
         if bot:
@@ -6176,6 +6210,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
             state["fwd_photo"], state["fwd_video"],
             state["fwd_audio"], state["fwd_doc"],
             state["cap_mode"], state.get("cap_prefix", ""),
+            state.get("start_after", 0) or 0,
         ))
 
     # ─── Terabox TXT file handler (Bulk Upload) ─────────────────
@@ -7655,6 +7690,7 @@ async def _forwarder_task(
     chat_id: int, src: str, dst: str, limit: Optional[int],
     fwd_photo: bool, fwd_video: bool, fwd_audio: bool, fwd_doc: bool,
     cap_mode: str, cap_prefix: str,
+    start_after: int = 0,
 ) -> None:
     creds = _get_user_credentials(chat_id)
     if not creds:
@@ -7687,7 +7723,7 @@ async def _forwarder_task(
         status_mid = _bot_send(chat_id, f"🔄 <b>Forwarding from {_esc(src_title)}…</b>\n⏳ Initializing high-speed direct stream…")
         dl_job_create(job_id, chat_id, src, f"Fwd: {src_title} -> {dst}", status_mid or 0, limit or 0)
 
-        skipped = dl_errors = sent = failed = processed = 0
+        skipped = dl_errors = sent = failed = processed = last_id = 0
         record     = _load_forward_record(src_title)
         total_ever = record.get("sent", 0)
 
@@ -7708,6 +7744,12 @@ async def _forwarder_task(
         except Exception as e:
             log.warning(f"[forwarder:{chat_id}] Checkpoint query failed: {e}")
 
+        # A resume ID typed by the user beats the DB checkpoint — the DB is wiped
+        # on every redeploy, so this is how a run picks up where the last one ended.
+        if start_after and start_after > 0:
+            dst_min_id = int(start_after)
+            log.info(f"[forwarder:{chat_id}] User resume point: skipping msg_id ≤ {dst_min_id}")
+
         if dst_min_id > 0:
             try:
                 probe = await client.get_messages(src_entity, limit=1, min_id=dst_min_id)
@@ -7724,7 +7766,8 @@ async def _forwarder_task(
                 job_clear(chat_id)
                 return
 
-            dedup_note = f"🔖 Resuming from checkpoint: Msg ID &gt; <code>{dst_min_id}</code>"
+            origin = "your input" if start_after else "saved checkpoint"
+            dedup_note = f"🔖 Resuming after Msg ID <code>{dst_min_id}</code> ({origin})"
         else:
             dedup_note = "🆕 High-speed direct forwarding active."
 
@@ -7918,7 +7961,7 @@ async def _forwarder_task(
             return "failed"
 
         async def _handle(group) -> None:
-            nonlocal sent, failed, dl_errors, skipped, processed
+            nonlocal sent, failed, dl_errors, skipped, processed, last_id
             res = await _send_group(group)
             if res == "sent":
                 sent += len(group)
@@ -7940,7 +7983,8 @@ async def _forwarder_task(
                               f"⚡ Direct Forward: <code>Active</code>\n"
                               f"✅ Sent: <code>{sent}</code>\n"
                               f"❌ Failed/Err: <code>{failed + dl_errors}</code>\n"
-                              f"⏭ Skipped: <code>{skipped}</code>")
+                              f"⏭ Skipped: <code>{skipped}</code>\n"
+                              f"🔖 Last msg ID: <code>{last_id}</code>")
                 except Exception:
                     pass
 
@@ -7955,8 +7999,12 @@ async def _forwarder_task(
             if ctrl == "stop":
                 if pending:
                     await _handle(pending); pending = []
-                _bot_send(chat_id, "⏹ Forwarder stopped by user.")
-                dl_job_update(job_id, sent, failed + dl_errors, msg.id, "stopped", "stopped")
+                _bot_send(chat_id,
+                          f"⏹ <b>Forwarder stopped.</b>\n"
+                          f"✅ Sent: <code>{sent}</code>\n"
+                          f"🔖 Last msg ID: <code>{last_id}</code>\n"
+                          f"<i>Send this ID at the resume step next time to continue from here.</i>")
+                dl_job_update(job_id, sent, failed + dl_errors, last_id or msg.id, "stopped", "stopped")
                 break
 
             if is_msg_processed(src, msg.id, task_scope) or is_msg_processed(src, msg.id, "forward"):
@@ -7986,8 +8034,12 @@ async def _forwarder_task(
                   f"🏁 <b>Forwarder complete!</b>\n"
                   f"✅ Sent: <code>{sent}</code>\n"
                   f"❌ Failed: <code>{failed}</code>\n"
-                  f"📦 Total ever forwarded: <code>{total_ever + sent}</code>")
-        dl_job_update(job_id, sent, failed + dl_errors, 0, "complete", "done")
+                  f"⏭ Skipped: <code>{skipped}</code>\n"
+                  f"🔖 Last msg ID: <code>{last_id or dst_min_id}</code>\n"
+                  f"📦 Total ever forwarded: <code>{total_ever + sent}</code>\n\n"
+                  f"<i>Save the Last msg ID — after a redeploy, enter it at the resume step "
+                  f"to continue from here.</i>")
+        dl_job_update(job_id, sent, failed + dl_errors, last_id or dst_min_id, "complete", "done")
 
     except Exception as e:
         log.error(f"[forwarder_task] {e}")
