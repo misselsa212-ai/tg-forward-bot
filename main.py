@@ -3061,30 +3061,54 @@ async def _async_download_to_disk(session, url, filename, total_size=0, dest_dir
         return None
 
 
-def _download_to_tempfile_sync(url: str, filename: str, dest_dir: str = DOWNLOAD_DIR, timeout: int = 120) -> Optional[str]:
-    """Synchronously download `url` to a temp file and return the path, or None."""
+class FileTooLargeError(Exception):
+    """Raised when a capped download exceeds max_bytes mid-stream."""
+
+
+def _download_to_tempfile_sync(url: str, filename: str, dest_dir: str = DOWNLOAD_DIR, timeout: int = 120,
+                               max_bytes: int = 0,
+                               referer: Optional[str] = "https://www.terabox.com/") -> Optional[str]:
+    """Synchronously download `url` to a temp file and return the path, or None.
+
+    max_bytes > 0 aborts with FileTooLargeError once that many bytes arrive,
+    which is how a server that omits Content-Length is handled safely.
+    Pass referer=None for hosts unrelated to Terabox.
+    """
     dest_dir = dest_dir or tempfile.gettempdir()
     os.makedirs(dest_dir, exist_ok=True)
     fd, filepath = tempfile.mkstemp(prefix="tdl_sync_", suffix="_" + _clean_name(filename, 50), dir=dest_dir)
     os.close(fd)
     try:
-        headers = {"Referer": "https://www.terabox.com/", "User-Agent": HEADERS.get('user-agent', '')}
+        headers = {"User-Agent": HEADERS.get('user-agent', '')}
+        if referer:
+            headers["Referer"] = referer
         r = requests.get(url, stream=True, timeout=timeout, headers=headers)
-        if r.status_code == 403:
+        if r.status_code == 403 and referer:
             log.info("[sync dl_to_temp] Got 403 with Referer. Retrying without Referer...")
             headers.pop("Referer", None)
             r = requests.get(url, stream=True, timeout=timeout, headers=headers)
         with r:
             r.raise_for_status()
+            written = 0
             with open(filepath, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
+                        written += len(chunk)
+                        if max_bytes and written > max_bytes:
+                            raise FileTooLargeError(f"exceeds {max_bytes} bytes")
                         f.write(chunk)
         # Ensure file is non-empty
         if os.path.getsize(filepath) == 0:
             os.remove(filepath)
             return None
         return filepath
+    except FileTooLargeError:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+        raise
     except Exception as e:
         log.warning(f"[sync dl_to_temp] {e}")
         try:
@@ -6669,23 +6693,35 @@ def register_handlers(b: telebot.TeleBot) -> None:
                     markup = InlineKeyboardMarkup()
                     markup.add(InlineKeyboardButton("⬇️ Download", url=info["download"]))
 
-                    # Unknown size is treated as too big: streaming a file of
-                    # unknown length into a 500MB upload would fail late.
-                    if size <= 0 or size > AUTO_SEND_LIMIT:
-                        note = ("\n\n⚠️ Size unknown — sending the link instead."
-                                if size <= 0 else
-                                f"\n\n⚠️ Over the {AUTO_SEND_LIMIT/MB:.0f}MB upload limit.")
-                        b.edit_message_text(head + note + "\n📥 Tap the button below.",
-                                            message.chat.id, status.message_id,
-                                            parse_mode="HTML", reply_markup=markup)
+                    if size > AUTO_SEND_LIMIT:
+                        b.edit_message_text(
+                            head + f"\n\n⚠️ Over the {AUTO_SEND_LIMIT/MB:.0f}MB upload limit."
+                                   "\n📥 Tap the button below.",
+                            message.chat.id, status.message_id,
+                            parse_mode="HTML", reply_markup=markup)
                         increment_links(uid)
                         save_history(uid, url, info)
                         return
 
-                    b.edit_message_text(f"📥 <b>Downloading…</b>\n\n<code>{_esc(fname)}</code>\n"
-                                        f"📦 {_esc(info['size_human'])}",
-                                        message.chat.id, status.message_id, parse_mode="HTML")
-                    path = _download_to_tempfile_sync(info["download"], fname, timeout=300)
+                    # Some hosts omit Content-Length. Rather than refuse, pull the
+                    # file with a hard cap and fall back to the link if it trips.
+                    b.edit_message_text(
+                        f"📥 <b>Downloading…</b>\n\n<code>{_esc(fname)}</code>\n"
+                        f"📦 {_esc(info['size_human'])}",
+                        message.chat.id, status.message_id, parse_mode="HTML")
+                    try:
+                        path = _download_to_tempfile_sync(
+                            info["download"], fname, timeout=300,
+                            max_bytes=AUTO_SEND_LIMIT, referer=None)
+                    except FileTooLargeError:
+                        b.edit_message_text(
+                            head + f"\n\n⚠️ Bigger than {AUTO_SEND_LIMIT/MB:.0f}MB — too large to upload."
+                                   "\n📥 Tap the button below.",
+                            message.chat.id, status.message_id,
+                            parse_mode="HTML", reply_markup=markup)
+                        increment_links(uid)
+                        save_history(uid, url, info)
+                        return
                     if not path:
                         b.edit_message_text(head + "\n\n❌ Download failed — try the button below.",
                                             message.chat.id, status.message_id,
