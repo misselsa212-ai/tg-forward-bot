@@ -1712,6 +1712,154 @@ def process_mega_link_sync(url: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# DIRECT LINK ENGINE  (any http(s) file URL, incl. Google Drive)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Unlike the Terabox cascade this needs no third-party API: the bot simply
+# fetches the URL itself. That makes it the most reliable path, but it also
+# means the URL comes straight from a user, so every request is screened for
+# SSRF first (see _is_safe_public_url).
+
+GDRIVE_DOMAINS = ["drive.google.com", "docs.google.com", "drive.usercontent.google.com"]
+
+
+def is_gdrive_url(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t.startswith("http") and any(d in t for d in GDRIVE_DOMAINS)
+
+
+def _gdrive_file_id(url: str) -> Optional[str]:
+    """Pull the file id out of any of Google Drive's share-link shapes."""
+    for pat in (r"/file/d/([A-Za-z0-9_-]{10,})",
+                r"/d/([A-Za-z0-9_-]{10,})",
+                r"[?&]id=([A-Za-z0-9_-]{10,})"):
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _gdrive_direct_url(url: str) -> Optional[str]:
+    """Share link → direct download URL.
+
+    Uses the usercontent host with confirm=t, which serves the file straight
+    away instead of the 'virus scan warning' interstitial that the old
+    /uc?export=download endpoint returns for large files.
+    """
+    fid = _gdrive_file_id(url)
+    if not fid:
+        return None
+    return ("https://drive.usercontent.google.com/download"
+            f"?id={fid}&export=download&confirm=t")
+
+
+def _is_safe_public_url(url: str) -> tuple[bool, str]:
+    """Reject anything that is not a public http(s) address.
+
+    The bot runs with its token and cloud credentials in the environment, so a
+    user-supplied URL must never be able to reach loopback, private ranges or
+    the cloud metadata service (169.254.169.254) and have the body handed back.
+    """
+    import ipaddress
+    import socket
+
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False, "Malformed URL."
+    if p.scheme not in ("http", "https"):
+        return False, "Only http:// and https:// links are supported."
+    host = p.hostname
+    if not host:
+        return False, "URL has no host."
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, f"Cannot resolve host <code>{_esc(host)}</code>."
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, "That address is not publicly routable."
+    return True, ""
+
+
+def _filename_from_headers(url: str, headers) -> str:
+    """Prefer Content-Disposition, fall back to the URL path."""
+    cd = headers.get("Content-Disposition") or headers.get("content-disposition") or ""
+    m = re.search(r"filename\*=(?:UTF-8'')?([^;]+)", cd, re.I) or \
+        re.search(r'filename="([^"]+)"', cd, re.I) or \
+        re.search(r"filename=([^;]+)", cd, re.I)
+    name = ""
+    if m:
+        name = urllib.parse.unquote(m.group(1).strip().strip('"'))
+    if not name:
+        path = urllib.parse.urlparse(url).path
+        name = urllib.parse.unquote(os.path.basename(path))
+    name = name.strip()
+    if not name or name in (".", ".."):
+        name = "file.bin"
+    return _clean_name(name, 90)
+
+
+def probe_direct_link(url: str) -> dict:
+    """Look up name / size / type without downloading the body.
+
+    Raises RuntimeError with a user-facing message when the URL is unusable.
+    """
+    ok, why = _is_safe_public_url(url)
+    if not ok:
+        raise RuntimeError(why)
+
+    s = _make_resilient_session(retries=2)
+    hdrs = {"User-Agent": HEADERS.get("user-agent", "")}
+    resp = None
+    try:
+        resp = s.head(url, headers=hdrs, allow_redirects=True, timeout=20)
+        if resp.status_code >= 400 or not resp.headers.get("Content-Length"):
+            resp = s.get(url, headers=hdrs, stream=True, allow_redirects=True, timeout=25)
+    except Exception as e:
+        raise RuntimeError(f"Could not reach the link: {_esc(str(e))}") from e
+
+    try:
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Server returned HTTP {resp.status_code}.")
+
+        # The final hop must still be public — redirects can leave the safe set.
+        ok, why = _is_safe_public_url(resp.url)
+        if not ok:
+            raise RuntimeError(f"Redirected to a blocked address. {why}")
+
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype in ("text/html", "application/xhtml+xml"):
+            raise RuntimeError(
+                "That link returns a web page, not a file.\n"
+                "Send a <b>direct</b> file link (the one that starts the download)."
+            )
+
+        size = 0
+        cl = resp.headers.get("Content-Length")
+        if cl and str(cl).isdigit():
+            size = int(cl)
+
+        return {
+            "filename":   _filename_from_headers(str(resp.url), resp.headers),
+            "size":       size,
+            "size_human": human_size(size) if size else "Unknown",
+            "download":   str(resp.url),
+            "content_type": ctype or "application/octet-stream",
+        }
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+# ══════════════════════════════════════════════════════════════════════
 # MULTI-API EXTRACTION SYSTEM
 # ══════════════════════════════════════════════════════════════════════
 #
@@ -4522,8 +4670,12 @@ def register_handlers(b: telebot.TeleBot) -> None:
         user_help = (
             "📖 <b>COMMAND GUIDE</b>\n"
             "────────────────────────────\n\n"
-            "<b>🔗 Link Extractor</b>\n"
-            "Just send a <b>Terabox</b> or <b>Mega.nz</b> link — no command needed.\n"
+            "<b>🔗 Link Downloader</b>\n"
+            "Just send a link — no command needed:\n"
+            "• <b>Terabox</b> — <code>terabox.com/s/…</code>\n"
+            "• <b>Mega.nz</b> — file or folder\n"
+            "• <b>Google Drive</b> — the normal share link\n"
+            "• <b>Any direct file link</b> — <code>site.com/video.mp4</code>\n\n"
             "Files ≤ 500MB are uploaded here; bigger ones come as a download link.\n"
             "You can also send a <code>.txt</code> file of Terabox links for bulk processing.\n"
             "<code>/mega &lt;link&gt;</code> — Mega file/folder (also <code>/megadl</code>)\n\n"
@@ -6465,15 +6617,107 @@ def register_handlers(b: telebot.TeleBot) -> None:
             enqueue_extraction(do_mega)
             return
 
+        # ── Any other http(s) link: fetch it directly (no third-party API) ──
         if not is_terabox_url(url):
-            return b.reply_to(
-                message,
-                "❓ Please send a valid <b>Terabox</b> or <b>Mega.nz</b> link.\n\n"
-                "Examples:\n"
-                "• <code>https://terabox.com/s/xxxxx</code>\n"
-                "• <code>https://mega.nz/file/xxxxx#key</code>",
-                parse_mode="HTML",
-            )
+            if not url.lower().startswith("http"):
+                return b.reply_to(
+                    message,
+                    "❓ Please send a valid link.\n\n"
+                    "Supported:\n"
+                    "• <b>Terabox</b> — <code>https://terabox.com/s/xxxxx</code>\n"
+                    "• <b>Mega.nz</b> — <code>https://mega.nz/file/xxxxx#key</code>\n"
+                    "• <b>Google Drive</b> — <code>https://drive.google.com/file/d/xxxxx/view</code>\n"
+                    "• Any <b>direct file link</b> — <code>https://site.com/video.mp4</code>",
+                    parse_mode="HTML",
+                )
+
+            allowed, wait = check_rate_limit(uid)
+            if not allowed:
+                mins, secs = divmod(wait, 60)
+                return b.reply_to(
+                    message,
+                    f"⏳ Rate limit reached! Try again in <code>{mins}m {secs}s</code>.\n\n"
+                    f"💎 Get unlimited access with /premium",
+                    parse_mode="HTML",
+                )
+
+            target = _gdrive_direct_url(url) if is_gdrive_url(url) else url
+            label  = "Google Drive" if is_gdrive_url(url) else "Direct link"
+            if target is None:
+                return b.reply_to(
+                    message,
+                    "❌ Could not read a file ID from that Google Drive link.\n"
+                    "Use the <b>share</b> link, e.g. "
+                    "<code>https://drive.google.com/file/d/FILE_ID/view</code>",
+                    parse_mode="HTML",
+                )
+
+            premium_badge = " 💎" if is_premium(uid) else ""
+            status = b.reply_to(message, f"🔗 <b>Checking {label}…</b>{premium_badge}", parse_mode="HTML")
+
+            def do_direct():
+                try:
+                    info = probe_direct_link(target)
+                    fname = info["filename"]
+                    size  = info["size"]
+                    _, type_label = _detect_file_category(fname)
+                    head = (f"✅ <b>{label} ready!</b>\n\n"
+                            f"📂 <b>File:</b> <code>{_esc(fname)}</code>\n"
+                            f"🏷 <b>Type:</b> <code>{type_label}</code>\n"
+                            f"📦 <b>Size:</b> <code>{_esc(info['size_human'])}</code>")
+
+                    markup = InlineKeyboardMarkup()
+                    markup.add(InlineKeyboardButton("⬇️ Download", url=info["download"]))
+
+                    # Unknown size is treated as too big: streaming a file of
+                    # unknown length into a 500MB upload would fail late.
+                    if size <= 0 or size > AUTO_SEND_LIMIT:
+                        note = ("\n\n⚠️ Size unknown — sending the link instead."
+                                if size <= 0 else
+                                f"\n\n⚠️ Over the {AUTO_SEND_LIMIT/MB:.0f}MB upload limit.")
+                        b.edit_message_text(head + note + "\n📥 Tap the button below.",
+                                            message.chat.id, status.message_id,
+                                            parse_mode="HTML", reply_markup=markup)
+                        increment_links(uid)
+                        save_history(uid, url, info)
+                        return
+
+                    b.edit_message_text(f"📥 <b>Downloading…</b>\n\n<code>{_esc(fname)}</code>\n"
+                                        f"📦 {_esc(info['size_human'])}",
+                                        message.chat.id, status.message_id, parse_mode="HTML")
+                    path = _download_to_tempfile_sync(info["download"], fname, timeout=300)
+                    if not path:
+                        b.edit_message_text(head + "\n\n❌ Download failed — try the button below.",
+                                            message.chat.id, status.message_id,
+                                            parse_mode="HTML", reply_markup=markup)
+                        return
+                    try:
+                        b.edit_message_text(f"📤 <b>Uploading to Telegram…</b>\n\n<code>{_esc(fname)}</code>",
+                                            message.chat.id, status.message_id, parse_mode="HTML")
+                        okay = _send_file_by_type(b, message.chat.id, path, fname, head,
+                                                  timeout=_send_timeout_for_size(size))
+                        if okay:
+                            increment_links(uid)
+                            save_history(uid, url, info)
+                            try: b.delete_message(message.chat.id, status.message_id)
+                            except Exception: pass
+                        else:
+                            b.edit_message_text(head + "\n\n❌ Upload failed — use the button below.",
+                                                message.chat.id, status.message_id,
+                                                parse_mode="HTML", reply_markup=markup)
+                    finally:
+                        _clean_file(path)
+                except Exception as e:
+                    log.error(f"[direct link] {e}")
+                    try:
+                        b.edit_message_text(f"❌ <b>Error:</b> {_esc(str(e))}",
+                                            message.chat.id, status.message_id, parse_mode="HTML")
+                    except Exception:
+                        pass
+
+            enqueue_extraction(do_direct)
+            return
+
         allowed, wait = check_rate_limit(uid)
         if not allowed:
             mins, secs = divmod(wait, 60)
