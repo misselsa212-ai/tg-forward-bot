@@ -4520,55 +4520,53 @@ def register_handlers(b: telebot.TeleBot) -> None:
         is_admin_user = _is_lx_auth(uid)
 
         user_help = (
-            "📖 <b>How to Use</b>\n\n"
-            "<b>🔗 Extract Terabox Links:</b>\n"
-            "Simply send any Terabox link and the bot will:\n"
-            "  ✅ Extract download URL\n"
-            "  ✅ Get stream links (360p, 480p, 720p, 1080p)\n"
-            "  ✅ Auto-send files ≤ 500MB\n"
-            "  ⚠️ Show download link for files > 500MB\n"
-            "  📊 Save to your history\n\n"
-            "<b>📝 Your Commands:</b>\n"
-            "<code>/start</code> — Welcome & info\n"
-            "<code>/help</code> — This message\n"
-            "<code>/stats</code> — View your stats\n"
-            "<code>/history</code> — Last 5 extractions\n"
-            "<code>/premium</code> — View premium plans\n"
-            "<code>/redeem &lt;code&gt;</code> — Activate premium\n\n"
-            "<b>⚡ Rate Limit:</b>\n"
-            f"📊 Normal users: {RATE_LIMIT} extractions per 10 minutes\n"
-            "💎 Premium users: Unlimited\n"
-            "🔐 Admins: Unlimited\n\n"
-            "<b>💎 Premium Features:</b>\n"
-            "✅ Unlimited extractions\n"
-            "✅ No rate limit\n"
-            "✅ Priority queue processing\n\n"
-            "<b>🤖 Userbot Tools:</b>\n"
-            "<code>/login</code> — Login to your Telegram account (Custom / String / Quick OTP)\n"
-            "<code>/login string</code> (or <code>/login_string</code>) — Login with StringSession directly\n"
-            "<code>/logout</code> — Log out (preserves session in database)\n"
-            "<code>/channels</code> — List all channels/groups\n"
-            "<code>/scraper</code> — Setup: scrape Terabox links & forward\n"
-            "<code>/download</code> — Setup: download media to disk\n"
-            "<code>/forward</code> — Setup: forward media between channels\n"
-            "<code>/gdrive_leech</code> — Setup: download files to Google Drive\n"
-            "<code>/github_login</code> — Setup: connect your GitHub account\n"
-            "<code>/github_leech</code> — Setup: upload files in chunks to GitHub\n"
-            "<code>/cron_start</code> — Start the background auto-leech daemon\n"
-            "<code>/cron_stop</code> — Stop the background auto-leech daemon\n"
-            "<code>/multi_target</code> — Configure multi-channel routing sources\n"
-            "<code>/mega_bypass</code> — Enable Mega/Terabox bypass hooks\n\n"
-            "<b>🎛 Job Control:</b>\n"
-            "<code>/pause (ps)</code> — Pause running job\n"
-            "<code>/resume (rm)</code> — Resume paused job\n"
-            "<code>/stop (so)</code> — Stop and discard job\n"
-            "<code>/status</code> — Show current job progress\n"
-            "<code>/cancel</code> — Cancel wizard setup\n\n"
-            "📤 <b>File Upload Policy:</b>\n"
-            "• Files ≤ 500MB → Auto-sent as document/video\n"
-            "• Files > 500MB → Download link sent\n"
-            "• HLS streams (M3U8) → Stream links only"
+            "📖 <b>COMMAND GUIDE</b>\n"
+            "────────────────────────────\n\n"
+            "<b>🔗 Link Extractor</b>\n"
+            "Just send a <b>Terabox</b> or <b>Mega.nz</b> link — no command needed.\n"
+            "Files ≤ 500MB are uploaded here; bigger ones come as a download link.\n"
+            "You can also send a <code>.txt</code> file of Terabox links for bulk processing.\n"
+            "<code>/mega &lt;link&gt;</code> — Mega file/folder (also <code>/megadl</code>)\n\n"
+            "<b>👤 Account</b>\n"
+            "<code>/start</code> — dashboard &amp; menu (also <code>/menu</code>)\n"
+            "<code>/help</code> — this guide\n"
+            "<code>/id</code> — your Telegram user ID\n"
+            "<code>/stats</code> — your usage stats\n"
+            "<code>/history</code> — last 5 extractions\n"
+            "<code>/premium</code> — plans &amp; payment info\n"
+            "<code>/redeem &lt;code&gt;</code> — activate premium\n\n"
+            "<b>🔑 Userbot Login</b>\n"
+            "<code>/login</code> — connect your Telegram account\n"
+            "<code>/login string</code> — log in with a StringSession\n"
+            "<code>/login force</code> — re-login even if a session exists\n"
+            "<code>/logout</code> — log out (session kept in the vault)\n"
+            "<code>/channels</code> — list your channels &amp; groups\n\n"
+            "<b>🤖 Userbot Tools</b>\n"
+            "<code>/forward</code> — copy posts between two channels\n"
+            "<code>/download</code> — download channel media to disk\n"
+            "<code>/scraper</code> — scrape Terabox links &amp; forward them\n"
+            "<code>/gdrive_leech</code> — leech files to Google Drive\n\n"
+            "<b>🎛 Job Control</b>\n"
+            "<code>/status</code> — live progress + 🔖 last msg ID\n"
+            "<code>/pause</code> (<code>ps</code>) — pause the running job\n"
+            "<code>/resume</code> (<code>rm</code>) — resume a paused job\n"
+            "<code>/stop</code> (<code>so</code>) — stop &amp; discard the job\n"
+            "<code>/cancel</code> — cancel a setup wizard\n\n"
+            "<b>🔁 About /forward</b>\n"
+            "It asks 5 things: source, destination, how many to scan, "
+            "<b>resume point</b>, and which media types.\n"
+            "• Albums are forwarded as one grouped post.\n"
+            "• At the resume step send the <b>last forwarded Msg ID</b> to continue "
+            "from there — useful after a redeploy wipes the database.\n"
+            "• Send <code>0</code> to use the saved checkpoint, or start from the beginning.\n\n"
+            f"<b>⚡ Limits</b>\n"
+            f"Free: {RATE_LIMIT} extractions / 10 min · Premium &amp; admins: unlimited"
         )
+        if is_admin_user:
+            user_help += (
+                "\n\n<b>🎛️ Admin</b>\n"
+                "<code>/panel</code> — full admin command list"
+            )
         m = InlineKeyboardMarkup(row_width=2)
         m.add(
             InlineKeyboardButton("🏠 Main Dashboard", callback_data="ui_menu_main"),
@@ -4607,7 +4605,16 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "<b>⚙️ Core Process Control:</b>\n"
             "<code>/checkpoint</code> — View/set checkpoints\n"
             "<code>/db_unlock</code> — Unlock database & clean duplicate instances\n"
+            "<code>/backup</code> — Back up DB &amp; sessions to Google Drive\n"
             "<code>/kill</code> — Force kill bot and stop all active tasks\n\n"
+            "<b>🔁 Forwarder Maintenance:</b>\n"
+            "<code>/reset_forward &lt;channel&gt;</code> — Clear a source's forward history\n"
+            "<code>/skipfwd &lt;channel&gt; &lt;n&gt;</code> — Mark latest N posts as already sent\n"
+            "<code>/status</code> — Live job progress + last msg ID\n"
+            "<code>/pause</code> · <code>/resume</code> · <code>/stop</code> — Control the running job\n\n"
+            "<b>🩺 Diagnostics:</b>\n"
+            "<code>/apihealth</code> — Test all extraction endpoints\n"
+            "<code>/proxystatus</code> — Proxy pool status\n\n"
             "<b>👤 User Access Gatekeeper:</b>\n"
             "<code>/pending</code> — Show pending approval requests\n"
             "<code>/approve &lt;id&gt;</code> — Approve a user\n"
@@ -4623,7 +4630,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "<code>/premiumcodes</code> — List all active license keys\n\n"
             "<b>🔑 Session Accounts:</b>\n"
             "<code>/list_accounts</code> — Show saved account sessions\n"
-            "<code>/show_account &lt;id&gt;</code> — Inspect session metadata\n\n"
+            "<code>/show_account &lt;id&gt;</code> — Inspect session metadata\n"
+            "<code>/user_channels &lt;id&gt;</code> — List that account's channels\n\n"
             f"{tier1_extra}"
         )
         b.send_message(message.chat.id, panel_text, parse_mode="HTML")
@@ -6738,15 +6746,27 @@ def run_bot() -> None:
     bot = _make_bot()
     try:
         bot.set_my_commands([
+            BotCommand("start", "Dashboard & main menu"),
             BotCommand("help", "Full command reference"),
+            BotCommand("login", "Connect your Telegram account"),
+            BotCommand("logout", "Log out (session kept)"),
             BotCommand("channels", "List all channels/groups"),
-            BotCommand("scraper", "Scrape Terabox links & forward"),
+            BotCommand("forward", "Forward posts between channels"),
             BotCommand("download", "Download media to disk"),
-            BotCommand("forward", "Forward media between channels"),
-            BotCommand("status", "Show current job progress"),
+            BotCommand("scraper", "Scrape Terabox links & forward"),
+            BotCommand("gdrive_leech", "Leech files to Google Drive"),
+            BotCommand("mega", "Download a Mega.nz link"),
+            BotCommand("status", "Job progress & last msg ID"),
             BotCommand("pause", "Pause current job"),
             BotCommand("resume", "Resume paused job"),
             BotCommand("stop", "Stop & discard current job"),
+            BotCommand("cancel", "Cancel the setup wizard"),
+            BotCommand("stats", "Your usage stats"),
+            BotCommand("history", "Last 5 extractions"),
+            BotCommand("premium", "Premium plans & payment"),
+            BotCommand("redeem", "Redeem a premium code"),
+            BotCommand("id", "Show your user ID"),
+            BotCommand("panel", "Admin control panel"),
         ])
     except Exception as e:
         log.warning(f"Could not set bot commands: {e}")
