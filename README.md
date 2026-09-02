@@ -90,7 +90,12 @@ movie.mkv
 
 Notes:
 
-- A link that returns a **web page** is rejected — send the direct file link.
+- Any file type works: archives (`.rar`, `.zip`, `.7z`), documents, APKs,
+  audio, images, video. Only an actual **web page** is rejected, and that is
+  decided by the first bytes of the body — a host that labels a real download
+  `text/html` is still accepted.
+- `HEAD` is treated as a hint only: hosts that answer it with an error, no
+  length, or the wrong type are re-checked with a streaming `GET`.
 - Hosts that omit `Content-Length` still work: the download runs with a hard cap
   and falls back to the button if it exceeds the limit.
 - Files served without an extension get one from `Content-Type`, so a video

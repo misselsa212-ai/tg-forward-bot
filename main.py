@@ -1800,7 +1800,7 @@ def _is_safe_public_url(url: str) -> tuple[bool, str]:
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
-        return False, f"Cannot resolve host <code>{_esc(host)}</code>."
+        return False, f"Cannot resolve host {host}."
     for info in infos:
         addr = info[4][0]
         try:
@@ -1866,10 +1866,35 @@ def _ensure_extension(filename: str, content_type: str) -> str:
     return f"{filename}{ext}" if ext else filename
 
 
+_HTML_CTYPES = ("text/html", "application/xhtml+xml")
+
+_HTML_SNIFF_RE = re.compile(rb"^(?:<!doctype\s+html|<html|<head|<body|<script|<!--|<\?xml)", re.I)
+
+
+def _looks_like_html(chunk: bytes) -> bool:
+    """True when the first bytes of a body really are a web page.
+
+    Content-Type alone is not evidence: file hosts routinely label every
+    response text/html, so a genuine .rar would be refused on the header. The
+    bytes settle it.
+    """
+    if not chunk:
+        return False
+    head = chunk[:1024]
+    if head[:3] == b"\xef\xbb\xbf":
+        head = head[3:]
+    return bool(_HTML_SNIFF_RE.match(head.lstrip()))
+
+
+def _ctype_of(resp) -> str:
+    return (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+
+
 def probe_direct_link(url: str) -> dict:
     """Look up name / size / type without downloading the body.
 
-    Raises RuntimeError with a user-facing message when the URL is unusable.
+    Raises RuntimeError with a plain-text user-facing message when the URL is
+    unusable — the caller HTML-escapes it, so no markup here.
     """
     ok, why = _is_safe_public_url(url)
     if not ok:
@@ -1878,12 +1903,27 @@ def probe_direct_link(url: str) -> dict:
     s = _make_resilient_session(retries=2)
     hdrs = {"User-Agent": HEADERS.get("user-agent", "")}
     resp = None
+    used_get = False
     try:
-        resp = s.head(url, headers=hdrs, allow_redirects=True, timeout=20)
-        if resp.status_code >= 400 or not resp.headers.get("Content-Length"):
+        try:
+            resp = s.head(url, headers=hdrs, allow_redirects=True, timeout=20)
+        except Exception:
+            resp = None
+        # A HEAD is only a hint. Many file hosts answer it with an error page,
+        # omit the length, or report text/html for a real download, so re-ask
+        # with GET whenever it looks unhelpful and judge from that response.
+        if (resp is None or resp.status_code >= 400
+                or not resp.headers.get("Content-Length")
+                or _ctype_of(resp) in _HTML_CTYPES):
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
             resp = s.get(url, headers=hdrs, stream=True, allow_redirects=True, timeout=25)
+            used_get = True
     except Exception as e:
-        raise RuntimeError(f"Could not reach the link: {_esc(str(e))}") from e
+        raise RuntimeError(f"Could not reach the link: {e}") from e
 
     try:
         if resp.status_code >= 400:
@@ -1894,12 +1934,23 @@ def probe_direct_link(url: str) -> dict:
         if not ok:
             raise RuntimeError(f"Redirected to a blocked address. {why}")
 
-        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if ctype in ("text/html", "application/xhtml+xml"):
-            raise RuntimeError(
-                "That link returns a web page, not a file.\n"
-                "Send a <b>direct</b> file link (the one that starts the download)."
-            )
+        ctype = _ctype_of(resp)
+        if ctype in _HTML_CTYPES:
+            sniff = b""
+            if used_get:
+                try:
+                    sniff = next(resp.iter_content(2048), b"") or b""
+                except Exception:
+                    sniff = b""
+            if not used_get or _looks_like_html(sniff):
+                raise RuntimeError(
+                    "That link returns a web page, not a file.\n"
+                    "Send the direct file link — the one that starts the download."
+                )
+            # Mislabelled: the bytes are a file. Drop the bogus type so the
+            # name and extension decide how it is sent.
+            log.info(f"[direct link] {url[:80]} says {ctype} but the body is not HTML — accepting.")
+            ctype = ""
 
         size = 0
         cl = resp.headers.get("Content-Length")
