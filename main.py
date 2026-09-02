@@ -5758,9 +5758,9 @@ def register_handlers(b: telebot.TeleBot) -> None:
             message.chat.id,
             "⏳ Requesting OTP from Telegram…\n\n"
             "4️⃣ <b>OTP:</b> Once you receive it, reply with the code.\n\n"
-            "⚠️ <b>CRITICAL:</b> DO NOT send just the 5-digit number or forward the message! "
-            "Telegram will detect it and immediately expire the code for security.\n"
-            "👉 Please add a space or hyphen in the middle, like: <code>12 345</code> or <code>123-45</code>\n\n"
+            "⚠️ <b>CRITICAL:</b> Never send the plain 5-digit code or forward Telegram's message — "
+            "Telegram instantly expires any code that appears in a sent message.\n"
+            "👉 Send it with a space between EVERY digit, like: <code>1 2 3 4 5</code>\n\n"
             "(send /cancel to abort):",
             parse_mode="HTML"
         )
@@ -6775,56 +6775,101 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
 
             # OTP prompt & handler registration is done by the sync bot flow
             # (_login_got_phone already sent the prompt and registered _login_got_otp).
-            # Here we just poll until the callback sets state["otp"].
-            for _ in range(300):  # 5 mins max
-                if state.get("otp"):
-                    break
-                if uid not in _conv:  # Cancelled
+            # Here we poll until the callback sets state["otp"], then sign in.
+            # On expired/invalid codes we resend / re-ask instead of aborting.
+            phone_code_hash = send_code_res.phone_code_hash
+            max_resends  = 2   # how many times we ask Telegram for a fresh code
+            max_attempts = 4   # total OTP attempts (invalid + expired)
+            resends = attempts = 0
+            signed_in = False
+
+            async def _wait_for_otp() -> Optional[str]:
+                for _ in range(300):  # 5 mins max
+                    if state.get("otp"):
+                        return state.get("otp")
+                    if uid not in _conv:  # Cancelled
+                        return None
+                    await asyncio.sleep(1)
+                return None
+
+            def _reask_otp(text: str):
+                if bot and otp_callback:
+                    m = bot.send_message(chat_id, text, parse_mode="HTML")
+                    bot.register_next_step_handler(m, otp_callback)
+                else:
+                    _bot_send(chat_id, text)
+
+            while not signed_in and attempts < max_attempts:
+                otp = await _wait_for_otp()
+                if otp is None:
+                    if uid not in _conv:
+                        return
+                    _bot_send(chat_id, "❌ OTP input timed out. Please try /login again.")
                     return
-                await asyncio.sleep(1)
+                state["otp"] = None
+                clean_otp = re.sub(r"\D", "", otp)   # keep digits only ("1 2 3 4 5" -> "12345")
+                attempts += 1
+                if not clean_otp:
+                    _reask_otp("❌ That doesn't look like a code. Send it as <code>1 2 3 4 5</code>:")
+                    continue
 
-            otp = state.get("otp")
-            if not otp:
-                _bot_send(chat_id, "❌ OTP input timed out. Please try /login again.")
-                return
+                _bot_send(chat_id, "⏳ Signing in…")   # never echo the code back
+                try:
+                    await client.sign_in(phone, clean_otp, phone_code_hash=phone_code_hash)
+                    signed_in = True
+                except errors.SessionPasswordNeededError:
+                    signed_in = "2fa"
+                except errors.PhoneCodeInvalidError:
+                    if attempts >= max_attempts:
+                        raise
+                    _reask_otp("❌ Wrong code. Try again — send it as <code>1 2 3 4 5</code>:")
+                except errors.PhoneCodeExpiredError:
+                    if resends >= max_resends:
+                        raise
+                    resends += 1
+                    try:
+                        send_code_res = await client.send_code_request(phone)
+                        phone_code_hash = send_code_res.phone_code_hash
+                    except errors.FloodWaitError as fw:
+                        _bot_send(chat_id, f"❌ Telegram asked to wait {fw.seconds}s before a new code. Try /login later.")
+                        return
+                    _reask_otp(
+                        "⚠️ That code expired (usually because the plain number was sent in a chat).\n"
+                        "📩 A <b>new code</b> has been sent to your Telegram app.\n"
+                        "👉 Send it with spaces between digits: <code>1 2 3 4 5</code>:"
+                    )
 
-            clean_otp = otp.replace(" ", "").replace("-", "").strip()
-
-            _bot_send(chat_id, f"⏳ Signing in with OTP: '{clean_otp}'...")
-            try:
-                await client.sign_in(phone, clean_otp, phone_code_hash=send_code_res.phone_code_hash)
-            except errors.SessionPasswordNeededError:
+            if signed_in == "2fa":
                 # Send 2FA prompt from the sync bot thread via _bot_send, then poll.
                 _bot_send(chat_id,
                           "5️⃣ <b>2FA Password:</b> Please send your two-step verification "
                           "password (send /cancel to abort):",
                           parse_mode="HTML")
-                # Register next-step handler so the bot picks up the reply
-                if bot and password_callback:
-                    # We need a real Message object to register next-step on the chat.
-                    # Use a flag message so pyTelegramBotAPI routes the next reply.
-                    import functools
-                    _pending = bot.send_message(
-                        chat_id,
-                        "⌨️ Waiting for your 2FA password…",
-                        parse_mode="HTML"
-                    )
-                    bot.register_next_step_handler(_pending, password_callback)
+                for pw_try in range(3):
+                    state["password"] = None
+                    if bot and password_callback:
+                        _pending = bot.send_message(chat_id, "⌨️ Waiting for your 2FA password…", parse_mode="HTML")
+                        bot.register_next_step_handler(_pending, password_callback)
 
-                for _ in range(300):
-                    if state.get("password"):
-                        break
-                    if uid not in _conv:
+                    password = None
+                    for _ in range(300):
+                        if state.get("password"):
+                            password = state.get("password"); break
+                        if uid not in _conv:
+                            return
+                        await asyncio.sleep(1)
+                    if not password:
+                        _bot_send(chat_id, "❌ 2FA password input timed out. Please try /login again.")
                         return
-                    await asyncio.sleep(1)
 
-                password = state.get("password")
-                if not password:
-                    _bot_send(chat_id, "❌ 2FA password input timed out. Please try /login again.")
-                    return
-
-                _bot_send(chat_id, "⏳ Signing in with 2FA password...")
-                await client.sign_in(password=password.strip())
+                    _bot_send(chat_id, "⏳ Signing in with 2FA password...")
+                    try:
+                        await client.sign_in(password=password.strip())
+                        break
+                    except errors.PasswordHashInvalidError:
+                        if pw_try == 2:
+                            raise
+                        _bot_send(chat_id, "❌ Wrong 2FA password. Please send it again:")
 
         # Success! Save credentials to database (Multi-Tenant)
         session_string = client.session.save()
@@ -6884,7 +6929,9 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
     except errors.PhoneCodeInvalidError:
         _bot_send(chat_id, "❌ Invalid OTP code. Please try /login again.")
     except errors.PhoneCodeExpiredError:
-        _bot_send(chat_id, "❌ OTP code has expired. Please try /login again.")
+        _bot_send(chat_id,
+                  "❌ OTP kept expiring. This happens when the plain code is sent/forwarded in any chat.\n"
+                  "Run /login again and send the code as <code>1 2 3 4 5</code> (spaces between digits).")
     except errors.PasswordHashInvalidError:
         _bot_send(chat_id, "❌ Invalid 2FA password. Please try /login again.")
     except Exception as e:
