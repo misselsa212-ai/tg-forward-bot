@@ -4928,6 +4928,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
     def cmd_logout(message):
         uid = message.from_user.id
         _conv.pop(uid, None)
+        _clear_steps(message.chat.id)
         has_creds = logout_user(uid)
         if has_creds:
             b.reply_to(
@@ -5416,6 +5417,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
     @b.message_handler(commands=["cancel"])
     def cmd_cancel(message):
         uid = message.from_user.id
+        _clear_steps(message.chat.id)
         if uid in _conv:
             _conv.pop(uid)
             b.reply_to(message, "❌ Wizard cancelled.")
@@ -5431,7 +5433,15 @@ def register_handlers(b: telebot.TeleBot) -> None:
         )
         return m
 
+    def _clear_steps(chat_id: int) -> None:
+        """Drop any pending next-step handlers for this chat so they cannot stack."""
+        try:
+            b.clear_step_handler_by_chat_id(chat_id)
+        except Exception:
+            pass
+
     def _start_login_flow(message):
+        _clear_steps(message.chat.id)
         msg = b.send_message(
             message.chat.id,
             "<b>🔐 Select Login Method:</b>\n\n"
@@ -5449,6 +5459,11 @@ def register_handlers(b: telebot.TeleBot) -> None:
         uid = call.from_user.id
         chat_id = call.message.chat.id
         mode = call.data.replace("login_mode_", "")
+
+        # The menu message already registered _login_choose_method as the next-step
+        # handler. Drop it, otherwise BOTH it and the handler we register below fire
+        # on the user's next message (double OTP requests, API_ID treated as phone).
+        _clear_steps(chat_id)
 
         existing_creds = _get_user_credentials(uid)
         default_api_id = _API_ID or (existing_creds[0] if existing_creds else None) or 39537854
@@ -5528,7 +5543,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
 
         # Check if the user directly sent a phone number (+91..., 98..., etc.)
         clean_num = re.sub(r"[^\d+]", "", text)
-        if clean_num.startswith("+") or (clean_num.isdigit() and len(clean_num) >= 8):
+        # Require '+' or >=10 digits so an 8-digit API_ID is never mistaken for a phone.
+        if clean_num.startswith("+") or (clean_num.isdigit() and len(clean_num) >= 10):
             _conv[uid] = {
                 "mode": "login",
                 "api_id": default_api_id,
@@ -5759,6 +5775,11 @@ def register_handlers(b: telebot.TeleBot) -> None:
         phone = re.sub(r"[^\d+]", "", raw_phone)
         if uid not in _conv:
             _conv[uid] = {"mode": "login"}
+        if _conv[uid].get("task_running"):
+            # A login task is already polling for this user; never start a second
+            # one (two send_code_requests invalidate each other's codes).
+            return
+        _conv[uid]["task_running"] = True
         _conv[uid]["phone"] = phone
         _conv[uid]["otp"] = None
         _conv[uid]["password"] = None
@@ -5776,14 +5797,15 @@ def register_handlers(b: telebot.TeleBot) -> None:
         # so pyTelegramBotAPI correctly routes the user's reply to _login_got_otp.
         otp_prompt = b.send_message(
             message.chat.id,
-            "⏳ Requesting OTP from Telegram…\n\n"
-            "4️⃣ <b>OTP:</b> Once you receive it, reply with the code.\n\n"
-            "⚠️ <b>CRITICAL:</b> Never send the plain 5-digit code or forward Telegram's message — "
-            "Telegram instantly expires any code that appears in a sent message.\n"
-            "👉 Send it with a space between EVERY digit, like: <code>1 2 3 4 5</code>\n\n"
-            "(send /cancel to abort):",
+            "📩 <b>Sending OTP to your Telegram app…</b>\n\n"
+            "👉 <b>Reply with a SPACE between every digit:</b>\n"
+            "<code>1 2 3 4 5</code>\n\n"
+            "❌ <code>12345</code> (plain) → Telegram expires it instantly.\n"
+            "❌ Forwarding Telegram's message → same.\n\n"
+            "(/cancel to abort)",
             parse_mode="HTML"
         )
+        _clear_steps(message.chat.id)
         b.register_next_step_handler(otp_prompt, _login_got_otp)
         _run_async(_login_task(message.chat.id, uid, _conv[uid], _login_got_otp, _login_got_2fa_password))
 
@@ -6581,6 +6603,10 @@ def _is_cancel(message) -> bool:
 
 def _cancel_conv(b, message) -> None:
     _conv.pop(message.from_user.id, None)
+    try:
+        b.clear_step_handler_by_chat_id(message.chat.id)
+    except Exception:
+        pass
     b.reply_to(message, "❌ Operation cancelled.")
 
 
@@ -6819,6 +6845,10 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
             def _reask_otp(text: str):
                 if bot and otp_callback:
                     m = bot.send_message(chat_id, text, parse_mode="HTML")
+                    try:
+                        bot.clear_step_handler_by_chat_id(chat_id)
+                    except Exception:
+                        pass
                     bot.register_next_step_handler(m, otp_callback)
                 else:
                     _bot_send(chat_id, text)
@@ -6873,6 +6903,10 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
                     state["password"] = None
                     if bot and password_callback:
                         _pending = bot.send_message(chat_id, "⌨️ Waiting for your 2FA password…", parse_mode="HTML")
+                        try:
+                            bot.clear_step_handler_by_chat_id(chat_id)
+                        except Exception:
+                            pass
                         bot.register_next_step_handler(_pending, password_callback)
 
                     password = None
