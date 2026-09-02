@@ -3520,6 +3520,75 @@ async def resolve_entity(client: TelegramClient, identifier: str) -> Any:
     )
 
 
+_INVITE_RE = re.compile(r"(?:t\.me/|telegram\.me/)(?:joinchat/|\+)([A-Za-z0-9_-]+)")
+
+
+def _joinable_slug(identifier: str) -> Optional[str]:
+    """Public @username / t.me slug that JoinChannelRequest can take, else None.
+
+    A bare numeric ID is never joinable: the account holds no access_hash for a
+    chat it has not seen, so Telegram cannot resolve it.
+    """
+    ident = re.sub(r"^(?:https?://)?(?:t\.me/|telegram\.me/|@)", "",
+                   (identifier or "").strip()).strip("/")
+    if not ident or ident.lstrip("-").isdigit() or "/" in ident:
+        return None
+    return ident
+
+
+async def _ensure_joined(client: TelegramClient, identifier: str) -> Any:
+    """Resolve a chat, joining it first when the account is not a member yet.
+
+    /forward and friends need the account to actually be in the chat. If it is
+    not, and the user supplied an invite link or @username, join and resolve
+    again — a numeric ID cannot be joined, so that error is passed through.
+    """
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.tl.functions.messages import ImportChatInviteRequest
+
+    try:
+        return await resolve_entity(client, identifier)
+    except Exception as first_err:
+        ident = str(identifier or "").strip()
+
+        invite = _INVITE_RE.search(ident)
+        if invite:
+            try:
+                log.info(f"[join] Not a member — importing invite {ident[:40]}…")
+                res = await client(ImportChatInviteRequest(invite.group(1)))
+                chats = getattr(res, "chats", None)
+                if chats:
+                    log.info(f"[join] Joined '{getattr(chats[0], 'title', '?')}'")
+                    return chats[0]
+            except Exception as e:
+                if "already" in str(e).lower():
+                    # Member after all — the first resolve just could not see it.
+                    try:
+                        return await resolve_entity(client, identifier)
+                    except Exception:
+                        pass
+                raise ValueError(
+                    f"Cannot join that invite link: {e}"
+                ) from e
+            raise first_err
+
+        slug = _joinable_slug(ident)
+        if slug:
+            try:
+                log.info(f"[join] Not a member — joining @{slug}…")
+                await client(JoinChannelRequest(slug))
+                return await resolve_entity(client, slug)
+            except Exception as e:
+                if "already" in str(e).lower():
+                    return await resolve_entity(client, slug)
+                raise ValueError(f"Cannot join @{slug}: {e}") from e
+
+        # Numeric ID and not a member: nothing we can do automatically.
+        raise ValueError(
+            f"{first_err}\n\nThis account is not in that chat. Send the "
+            f"<b>invite link</b> or <b>@username</b> instead of a numeric ID "
+            f"and it will be joined automatically."
+        )
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 10 — BOT (pyTelegramBotAPI)
 # ══════════════════════════════════════════════════════════════════════
@@ -4336,8 +4405,15 @@ def _render_status_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
 def register_handlers(b: telebot.TeleBot) -> None:
 
     def _normalize_channel_input(text: str) -> str:
-        """Convert t.me links and @usernames to bare slugs for resolve_entity."""
+        """Convert t.me links and @usernames to bare slugs for resolve_entity.
+
+        Invite links are returned untouched: stripping them would drop the hash
+        (t.me/joinchat/<hash> used to come back as just "joinchat"), and that
+        hash is the only thing that can join a private chat.
+        """
         text = (text or "").strip()
+        if _INVITE_RE.search(text):
+            return text
         m = re.match(r"https?://t\.me/([^\s/?]+)", text)
         if m:
             return m.group(1)
@@ -4867,6 +4943,8 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "⚠️ OTP: send it spaced — <code>1 2 3 4 5</code>. "
             "A plain <code>12345</code> is killed by Telegram.\n\n"
             "<b>🤖 CHANNEL TOOLS</b> (need /login)\n"
+            "Not in the channel yet? Give the <b>invite link</b> or "
+            "<b>@username</b> — it joins automatically.\n"
             "<code>/forward</code> — copy posts A → B\n"
             "<code>/download</code> — save channel media to disk\n"
             "<code>/scraper</code> — pull Terabox links &amp; forward\n"
@@ -7244,9 +7322,13 @@ def _cancel_conv(b, message) -> None:
 
 
 def _channel_hint(chat_id: int) -> str:
+    tail = ("\n💡 Not a member yet? Send the <b>invite link</b> or <b>@username</b> "
+            "and it will be joined automatically (a numeric ID cannot be joined).")
     if _chat_cache.get(chat_id):
-        return "Enter the <b>row number</b> from the list, @username, or chat ID."
-    return "Enter @username or chat ID. Run /channels first to pick by number."
+        return ("Enter the <b>row number</b> from the list, @username, invite link, "
+                "or chat ID." + tail)
+    return ("Enter @username, an invite link, or a chat ID. "
+            "Run /channels first to pick by number." + tail)
 
 
 def _resolve_channel(chat_id: int, text: str) -> tuple[str, str]:
@@ -8004,12 +8086,12 @@ async def _scraper_task(
         primary = clients[0]
 
         try:
-            src_entity = await resolve_entity(primary, src)
+            src_entity = await _ensure_joined(primary, src)
         except Exception as e:
             _bot_send(chat_id, f"❌ Cannot resolve source `{_esc(src)}`: {_esc(str(e))}")
             return
         try:
-            dst_entity = await resolve_entity(primary, dst)
+            dst_entity = await _ensure_joined(primary, dst)
         except Exception as e:
             _bot_send(chat_id, f"❌ Cannot resolve dest `{_esc(dst)}`: {_esc(str(e))}")
             return
@@ -8245,7 +8327,7 @@ async def _downloader_task(
             _bot_edit(chat_id, status_msg_id, "❌ Session expired or revoked. Please run /login again.")
             return
         try:
-            entity      = await resolve_entity(client, src)
+            entity      = await _ensure_joined(client, src)
             folder_name = _clean_name(
                 getattr(entity, "title", None) or
                 getattr(entity, "username", None) or str(src), max_len=60
@@ -8503,8 +8585,8 @@ async def _forwarder_task(
             _bot_send(chat_id, "❌ Session expired or revoked. Please run /login again.")
             return
         try:
-            src_entity = await resolve_entity(client, src)
-            dst_entity = await resolve_entity(client, dst)
+            src_entity = await _ensure_joined(client, src)
+            dst_entity = await _ensure_joined(client, dst)
             src_title  = getattr(src_entity, "title", None) or str(src)
         except Exception as e:
             _bot_send(chat_id, f"❌ Cannot resolve: <code>{_esc(str(e))}</code>")
@@ -8863,7 +8945,7 @@ async def _skip_fwd_task(chat_id: int, src: str, count: int, status_msg_id: int)
             return
 
         try:
-            entity = await resolve_entity(client, src)
+            entity = await _ensure_joined(client, src)
             src_title = getattr(entity, "title", None) or str(src)
         except Exception as e:
             _bot_edit(chat_id, status_msg_id, f"❌ Cannot resolve source `{src}`: {e}")
