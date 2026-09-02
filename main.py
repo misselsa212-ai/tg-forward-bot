@@ -256,6 +256,26 @@ _API_HASH = os.environ.get("API_HASH") or None
 # Bot token: prefer environment, but allow hardcoded fallback for quick local runs
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
+# ── Shared worker account ────────────────────────────────────────────
+# One account that does the heavy uploads for every user, so nobody has to
+# /login just to receive a large file. It cannot post as the bot into a user's
+# chat, so it uploads into a private dump channel and the bot copies the
+# message out to the user — copying has no 50MB cap because the file already
+# lives on Telegram's servers.
+WORKER_API_ID   = _get_env_int("WORKER_API_ID", 0)
+WORKER_API_HASH = (os.environ.get("WORKER_API_HASH") or "").strip()
+WORKER_SESSION  = (os.environ.get("WORKER_SESSION") or "").strip()
+_DUMP_RAW       = (os.environ.get("DUMP_CHANNEL_ID") or "").strip()
+try:
+    DUMP_CHANNEL_ID: Optional[int] = int(_DUMP_RAW) if _DUMP_RAW else None
+except ValueError:
+    DUMP_CHANNEL_ID = None
+
+
+def worker_configured() -> bool:
+    return bool(WORKER_API_ID and WORKER_API_HASH and WORKER_SESSION and DUMP_CHANNEL_ID)
+
+
 # No global userbot accounts by default — use per-user credentials saved in the DB.
 USERBOT_ACCOUNTS: list[tuple[int, str]] = []
 DOWNLOAD_DIR  = tempfile.gettempdir()
@@ -3021,6 +3041,83 @@ def _progress_bar(done: int, total: int, width: int = 16) -> str:
     filled = int(width * pct)
     return "█" * filled + "░" * (width - filled) + f" {pct*100:.1f}%"
 
+def _fmt_eta(seconds: float) -> str:
+    """Compact duration: 45s / 3m 20s / 1h 04m."""
+    try:
+        s = int(max(0, seconds))
+    except Exception:
+        return "—"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s//60}m {s%60:02d}s"
+    return f"{s//3600}h {(s%3600)//60:02d}m"
+
+
+def _fmt_speed(bytes_per_sec: float) -> str:
+    if not bytes_per_sec or bytes_per_sec <= 0:
+        return "—"
+    return f"{human_size(int(bytes_per_sec))}/s"
+
+
+def render_progress(title: str, filename: str, done: int, total: int,
+                    elapsed: float) -> str:
+    """The live transfer panel shown while a file moves.
+
+    total may be 0 when the host sends no Content-Length, in which case the
+    bar and ETA are omitted rather than shown as a wrong 0%.
+    """
+    speed = (done / elapsed) if elapsed > 0 else 0
+    lines = [f"{title}\n", f"<code>{_esc(filename)}</code>\n"]
+    if total > 0:
+        pct = min(100.0, done * 100.0 / total)
+        filled = int(16 * pct / 100)
+        bar = "█" * filled + "░" * (16 - filled)
+        eta = ((total - done) / speed) if speed > 0 else 0
+        lines.append(f"<code>[{bar}] {pct:.1f}%</code>\n")
+        lines.append(f"📦 {human_size(done)} / {human_size(total)}\n")
+        lines.append(f"⚡ {_fmt_speed(speed)}  ·  ⏱ {_fmt_eta(elapsed)}"
+                     f"  ·  ⏳ {_fmt_eta(eta)} left")
+    else:
+        lines.append(f"📦 {human_size(done)} transferred\n")
+        lines.append(f"⚡ {_fmt_speed(speed)}  ·  ⏱ {_fmt_eta(elapsed)}")
+    return "".join(lines)
+
+
+class TransferProgress:
+    """Throttled progress panel — edits one Telegram message as bytes move.
+
+    Telegram rate-limits edits, so refresh no faster than every few seconds
+    and skip an edit when the rendered text has not changed.
+    """
+
+    def __init__(self, chat_id: int, msg_id: Optional[int], title: str,
+                 filename: str, total: int = 0, every: float = 4.0):
+        self.chat_id = chat_id
+        self.msg_id = msg_id
+        self.title = title
+        self.filename = filename
+        self.total = total
+        self.every = every
+        self.started = time.time()
+        self._last_edit = 0.0
+        self._last_text = ""
+
+    def elapsed(self) -> float:
+        return time.time() - self.started
+
+    def update(self, done: int, total: Optional[int] = None, force: bool = False) -> None:
+        if total:
+            self.total = total
+        now = time.time()
+        if not force and (now - self._last_edit) < self.every:
+            return
+        text = render_progress(self.title, self.filename, done, self.total, self.elapsed())
+        if text == self._last_text:
+            return
+        self._last_edit = now
+        self._last_text = text
+        _bot_edit(self.chat_id, self.msg_id, text)
 
 def _fetch_thumb(url: str) -> Optional[BytesIO]:
     if not url:
@@ -3109,7 +3206,8 @@ class FileTooLargeError(Exception):
 
 def _download_to_tempfile_sync(url: str, filename: str, dest_dir: str = DOWNLOAD_DIR, timeout: int = 120,
                                max_bytes: int = 0,
-                               referer: Optional[str] = "https://www.terabox.com/") -> Optional[str]:
+                               referer: Optional[str] = "https://www.terabox.com/",
+                               progress: "Optional[TransferProgress]" = None) -> Optional[str]:
     """Synchronously download `url` to a temp file and return the path, or None.
 
     max_bytes > 0 aborts with FileTooLargeError once that many bytes arrive,
@@ -3132,6 +3230,10 @@ def _download_to_tempfile_sync(url: str, filename: str, dest_dir: str = DOWNLOAD
         with r:
             r.raise_for_status()
             written = 0
+            if progress is not None:
+                cl = r.headers.get("Content-Length")
+                if cl and str(cl).isdigit():
+                    progress.total = int(cl)
             with open(filepath, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
@@ -3139,6 +3241,8 @@ def _download_to_tempfile_sync(url: str, filename: str, dest_dir: str = DOWNLOAD
                         if max_bytes and written > max_bytes:
                             raise FileTooLargeError(f"exceeds {max_bytes} bytes")
                         f.write(chunk)
+                        if progress is not None:
+                            progress.update(written)
         # Ensure file is non-empty
         if os.path.getsize(filepath) == 0:
             os.remove(filepath)
@@ -4742,9 +4846,9 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "• <b>Mega.nz</b> — file or folder\n"
             "• <b>Google Drive</b> — the normal share link\n"
             "• <b>Any direct file link</b> — <code>site.com/video.mp4</code>\n\n"
-            "<b>Size:</b> up to <b>50MB</b> arrives here in chat. After <code>/login</code> "
-            "files up to <b>2GB</b> are uploaded by your own account into your "
-            "<b>Saved Messages</b>. Anything larger comes as a download link.\n"
+            "<b>Size:</b> files up to <b>2GB</b> are delivered right here in chat, "
+            "with a live progress bar (speed, elapsed, ETA). Anything larger comes "
+            "as a download link.\n"
             "You can also send a <code>.txt</code> file of Terabox links for bulk processing.\n"
             "<code>/mega &lt;link&gt;</code> — Mega file/folder (also <code>/megadl</code>)\n\n"
             "<b>👤 Account</b>\n"
@@ -4832,6 +4936,9 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "<code>/skipfwd &lt;channel&gt; &lt;n&gt;</code> — Mark latest N posts as already sent\n"
             "<code>/status</code> — Live job progress + last msg ID\n"
             "<code>/pause</code> · <code>/resume</code> · <code>/stop</code> — Control the running job\n\n"
+            "<b>🛠 Worker Account (2GB uploads):</b>\n"
+            "<code>/worker</code> — Worker + dump-channel status\n"
+            "<code>/joinchat &lt;link&gt;</code> — Worker joins a channel (link/@username only)\n\n"
             "<b>🩺 Diagnostics:</b>\n"
             "<code>/apihealth</code> — Test all extraction endpoints\n"
             "<code>/proxystatus</code> — Proxy pool status\n\n"
@@ -5512,6 +5619,66 @@ def register_handlers(b: telebot.TeleBot) -> None:
         except Exception:
             pass
         b.send_message(message.chat.id, text, parse_mode="HTML")
+
+    @b.message_handler(commands=["joinchat", "worker_join"])
+    def cmd_worker_join(message):
+        if not _is_lx_auth(message.from_user.id):
+            return b.reply_to(message, "⛔ Admin only.")
+        if not worker_configured():
+            return b.reply_to(
+                message,
+                "❌ Worker account is not configured.\n"
+                "Set <code>WORKER_API_ID</code>, <code>WORKER_API_HASH</code>, "
+                "<code>WORKER_SESSION</code> and <code>DUMP_CHANNEL_ID</code>.",
+                parse_mode="HTML")
+        parts = message.text.split()
+        if len(parts) < 2:
+            return b.reply_to(
+                message,
+                "ℹ️ <b>Usage:</b> <code>/joinchat &lt;invite link or @username&gt;</code>\n\n"
+                "A numeric ID cannot be joined — Telegram needs a link or username.",
+                parse_mode="HTML")
+        status = b.reply_to(message, "⏳ Joining…")
+        ok, why = _run_async(worker_join_link(parts[1])).result(timeout=120)
+        b.edit_message_text(
+            (f"✅ Worker {why}." if ok else f"❌ Could not join: <code>{_esc(why)}</code>"),
+            message.chat.id, status.message_id, parse_mode="HTML")
+
+    @b.message_handler(commands=["worker", "workerstatus"])
+    def cmd_worker_status(message):
+        if not _is_lx_auth(message.from_user.id):
+            return b.reply_to(message, "⛔ Admin only.")
+        if not worker_configured():
+            missing = [n for n, v in (("WORKER_API_ID", WORKER_API_ID),
+                                      ("WORKER_API_HASH", WORKER_API_HASH),
+                                      ("WORKER_SESSION", WORKER_SESSION),
+                                      ("DUMP_CHANNEL_ID", DUMP_CHANNEL_ID)) if not v]
+            return b.reply_to(
+                message,
+                "⚪ <b>Worker not configured.</b>\nMissing: <code>"
+                + "</code>, <code>".join(missing) + "</code>\n\n"
+                "Without it, files over 50MB need each user to <code>/login</code>.",
+                parse_mode="HTML")
+        status = b.reply_to(message, "⏳ Checking worker…")
+
+        async def _check():
+            c = await _get_worker_client()
+            if c is None:
+                return "❌ Worker session invalid or could not connect."
+            me = await c.get_me()
+            who = f"@{me.username}" if getattr(me, "username", None) else str(me.id)
+            try:
+                ent = await c.get_entity(DUMP_CHANNEL_ID)
+                dump = f"✅ <code>{_esc(getattr(ent, 'title', DUMP_CHANNEL_ID))}</code>"
+            except Exception as e:
+                dump = f"❌ cannot reach ({_esc(str(e))})"
+            return (f"🟢 <b>Worker online</b>\n\n"
+                    f"👤 Account: <code>{_esc(who)}</code>\n"
+                    f"🗄 Dump channel: {dump}\n"
+                    f"📦 Upload ceiling: <code>{USERBOT_UPLOAD_LIMIT/MB:.0f}MB</code>")
+
+        text = _run_async(_check()).result(timeout=120)
+        b.edit_message_text(text, message.chat.id, status.message_id, parse_mode="HTML")
 
     @b.message_handler(commands=["reset_forward", "resetfwd", "reset"])
     def cmd_reset_forward(message):
@@ -6737,9 +6904,11 @@ def register_handlers(b: telebot.TeleBot) -> None:
                     markup = InlineKeyboardMarkup()
                     markup.add(InlineKeyboardButton("⬇️ Download", url=info["download"]))
 
-                    # A bot token tops out at 50MB; the user's own account reaches
-                    # 2GB, so the ceiling depends on whether they are logged in.
-                    has_userbot = bool(_get_user_credentials(uid))
+                    # A bot token tops out at 50MB. The shared worker account
+                    # reaches 2GB for everyone; a personal login is the fallback
+                    # when no worker is configured.
+                    has_worker   = worker_configured()
+                    has_userbot  = has_worker or bool(_get_user_credentials(uid))
                     cap = USERBOT_UPLOAD_LIMIT if has_userbot else BOT_UPLOAD_LIMIT
 
                     if size > cap:
@@ -6756,14 +6925,14 @@ def register_handlers(b: telebot.TeleBot) -> None:
 
                     # Some hosts omit Content-Length. Rather than refuse, pull the
                     # file with a hard cap and fall back to the link if it trips.
-                    b.edit_message_text(
-                        f"📥 <b>Downloading…</b>\n\n<code>{_esc(fname)}</code>\n"
-                        f"📦 {_esc(info['size_human'])}",
-                        message.chat.id, status.message_id, parse_mode="HTML")
+                    dl_prog = TransferProgress(
+                        message.chat.id, status.message_id,
+                        "📥 <b>Downloading…</b>", fname, total=size)
+                    dl_prog.update(0, force=True)
                     try:
                         path = _download_to_tempfile_sync(
                             info["download"], fname, timeout=600,
-                            max_bytes=cap, referer=None)
+                            max_bytes=cap, referer=None, progress=dl_prog)
                     except FileTooLargeError:
                         hint = ("" if has_userbot else
                                 "\n💡 <code>/login</code> raises this to 2GB.")
@@ -6797,15 +6966,30 @@ def register_handlers(b: telebot.TeleBot) -> None:
                                 b.edit_message_text(head + "\n\n❌ Upload failed — use the button below.",
                                                     message.chat.id, status.message_id,
                                                     parse_mode="HTML", reply_markup=markup)
+                        elif has_worker:
+                            # Worker uploads to the dump channel, bot copies it here.
+                            took = dl_prog.elapsed()
+                            ok_up, why = _run_async(
+                                worker_deliver_file(uid, path, fname, head,
+                                                    status.message_id)
+                            ).result(timeout=7200)
+                            if ok_up:
+                                increment_links(uid)
+                                save_history(uid, url, info)
+                                b.edit_message_text(
+                                    f"✅ <b>Done!</b>\n\n"
+                                    f"📂 <code>{_esc(fname)}</code>\n"
+                                    f"📦 {human_size(real_size)}\n"
+                                    f"⏱ Downloaded in {_fmt_eta(took)}",
+                                    message.chat.id, status.message_id, parse_mode="HTML")
+                            else:
+                                b.edit_message_text(
+                                    head + f"\n\n❌ Upload failed: <code>{_esc(why)}</code>"
+                                           "\n📥 Use the button below.",
+                                    message.chat.id, status.message_id,
+                                    parse_mode="HTML", reply_markup=markup)
                         else:
-                            # Too big for the bot token — hand it to the userbot.
-                            b.edit_message_text(
-                                f"📤 <b>Uploading via your account…</b>\n\n"
-                                f"<code>{_esc(fname)}</code>\n"
-                                f"📦 {human_size(real_size)}\n\n"
-                                f"<i>Over {BOT_UPLOAD_LIMIT/MB:.0f}MB, so it goes to your "
-                                f"Saved Messages.</i>",
-                                message.chat.id, status.message_id, parse_mode="HTML")
+                            # No worker — fall back to the user's own account.
                             ok_up, why = _run_async(
                                 _userbot_upload_file(uid, path, fname, head)
                             ).result(timeout=3600)
@@ -7516,6 +7700,135 @@ async def _admin_user_channels_task(admin_chat: int, status_msg_id: int, target_
                   (head if i == 0 else "") +
                   f"\n📡 <b>Channels &amp; Groups</b> [{i+1}–{i+len(chunk)} of {len(rows)}]\n{body}")
 
+
+_worker_client: Optional[TelegramClient] = None
+_worker_lock: Optional[asyncio.Lock] = None
+
+
+def _get_worker_lock() -> asyncio.Lock:
+    global _worker_lock
+    if _worker_lock is None:
+        _worker_lock = asyncio.Lock()
+    return _worker_lock
+
+
+async def _get_worker_client() -> Optional[TelegramClient]:
+    """Connect the shared worker account once and reuse it.
+
+    One account means one rate-limit bucket, so jobs are serialised by the
+    caller holding _get_worker_lock() around a whole transfer.
+    """
+    global _worker_client
+    if not worker_configured():
+        return None
+    if _worker_client is not None and _worker_client.is_connected():
+        return _worker_client
+    try:
+        _worker_client = TelegramClient(
+            StringSession(WORKER_SESSION), WORKER_API_ID, WORKER_API_HASH,
+            connection_retries=5, auto_reconnect=True, timeout=60,
+        )
+        await _worker_client.connect()
+        if not await _worker_client.is_user_authorized():
+            log.error("[worker] WORKER_SESSION is not authorized — check the string session.")
+            await _worker_client.disconnect()
+            _worker_client = None
+            return None
+        me = await _worker_client.get_me()
+        log.info(f"[worker] Connected as {getattr(me, 'username', None) or me.id}")
+        return _worker_client
+    except Exception as e:
+        log.error(f"[worker] Connect failed: {e}")
+        _worker_client = None
+        return None
+
+
+async def worker_join_link(link: str) -> tuple[bool, str]:
+    """Join a channel from an invite link or @username with the worker account.
+
+    Only links and usernames can be joined: a bare numeric ID carries no
+    access_hash, so Telegram cannot resolve a chat the account is not in.
+    """
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.tl.functions.messages import ImportChatInviteRequest
+
+    client = await _get_worker_client()
+    if client is None:
+        return False, "worker account is not configured"
+
+    link = (link or "").strip()
+    m = re.search(r"(?:t\.me/|telegram\.me/)(?:joinchat/|\+)([A-Za-z0-9_-]+)", link)
+    try:
+        if m:
+            await client(ImportChatInviteRequest(m.group(1)))
+            return True, "joined via invite link"
+        slug = re.sub(r"^(?:https?://)?(?:t\.me/|telegram\.me/|@)", "", link).strip("/")
+        if not slug or slug.lstrip("-").isdigit():
+            return False, ("a numeric ID cannot be joined — send an invite link "
+                           "or @username")
+        await client(JoinChannelRequest(slug))
+        return True, f"joined @{slug}"
+    except Exception as e:
+        msg = str(e)
+        if "already" in msg.lower():
+            return True, "already a member"
+        return False, msg
+
+
+async def worker_deliver_file(chat_id: int, file_path: str, filename: str,
+                              caption: str, status_msg_id: Optional[int]) -> tuple[bool, str]:
+    """Upload with the worker account, then have the bot copy it to the user.
+
+    The worker is a normal account, so it cannot post as the bot into the
+    user's chat. It uploads into the private dump channel instead and the bot
+    copies that message out — a copy references a file already on Telegram's
+    servers, so the 50MB upload cap does not apply.
+    """
+    client = await _get_worker_client()
+    if client is None:
+        return False, "worker account is not configured"
+
+    size = os.path.getsize(file_path)
+    category, _ = _detect_file_category(filename)
+    prog = TransferProgress(chat_id, status_msg_id, "📤 <b>Uploading to Telegram…</b>",
+                            filename, total=size)
+    loop = asyncio.get_event_loop()
+
+    def _cb(done, total):
+        # Editing a message is a blocking HTTP call; keep it off the loop.
+        try:
+            loop.run_in_executor(None, prog.update, done, total or size)
+        except Exception:
+            pass
+
+    async with _get_worker_lock():
+        try:
+            dump = await client.get_entity(DUMP_CHANNEL_ID)
+            sent = await client.send_file(
+                dump, file_path,
+                caption=f"{filename}\n<code>{chat_id}</code>",
+                parse_mode="html",
+                force_document=category not in ("video", "audio", "photo"),
+                supports_streaming=(category == "video"),
+                attributes=[tl_types.DocumentAttributeFilename(filename)],
+                progress_callback=_cb,
+            )
+        except errors.FloodWaitError as e:
+            return False, f"Telegram asked to wait {e.seconds}s"
+        except Exception as e:
+            log.error(f"[worker upload] {e}")
+            return False, str(e)
+
+    # Hand it to the user through the bot, which needs no re-upload.
+    try:
+        if bot is None:
+            return False, "bot is not running"
+        bot.copy_message(chat_id, DUMP_CHANNEL_ID, sent.id,
+                         caption=caption[:1024], parse_mode="HTML")
+        return True, "delivered"
+    except Exception as e:
+        log.error(f"[worker relay] {e}")
+        return False, f"uploaded but could not copy to you: {e}"
 
 async def _userbot_upload_file(chat_id: int, file_path: str, filename: str,
                                caption: str = "") -> tuple[bool, str]:
