@@ -278,7 +278,12 @@ RATE_LIMIT              = 5          # per 10 min (non-admin users)
 MAX_BOT_THREADS         = 10
 # Telegram Bot API hard cap for file uploads is ~500 MB — enforce safely
 CUTOFF_BLOCK_MB         = 500
-AUTO_SEND_LIMIT         = 500 * 1024 * 1024    # 500 MB — Telegram Bot API limit for direct uploads
+AUTO_SEND_LIMIT         = 500 * 1024 * 1024    # legacy ceiling used by the Terabox/Mega paths
+# A bot token may only upload 50 MB through the Bot API. The user's own
+# account (API_ID + hash + session) talks MTProto instead and reaches 2 GB,
+# so anything above the bot cap is uploaded by the userbot when one is linked.
+BOT_UPLOAD_LIMIT        = 50 * 1024 * 1024          # 50 MB  — Bot API hard cap
+USERBOT_UPLOAD_LIMIT    = 2 * 1024 * 1024 * 1024    # 2 GB   — MTProto cap
 AUTO_SCRAPER_SEND_LIMIT = 2 * 1024 * 1024 * 1024   # 2 GB
 MAX_CONCURRENT_TASKS    = 3
 COOLDOWN_SECONDS        = 20
@@ -4737,7 +4742,9 @@ def register_handlers(b: telebot.TeleBot) -> None:
             "• <b>Mega.nz</b> — file or folder\n"
             "• <b>Google Drive</b> — the normal share link\n"
             "• <b>Any direct file link</b> — <code>site.com/video.mp4</code>\n\n"
-            "Files ≤ 500MB are uploaded here; bigger ones come as a download link.\n"
+            "<b>Size:</b> up to <b>50MB</b> arrives here in chat. After <code>/login</code> "
+            "files up to <b>2GB</b> are uploaded by your own account into your "
+            "<b>Saved Messages</b>. Anything larger comes as a download link.\n"
             "You can also send a <code>.txt</code> file of Terabox links for bulk processing.\n"
             "<code>/mega &lt;link&gt;</code> — Mega file/folder (also <code>/megadl</code>)\n\n"
             "<b>👤 Account</b>\n"
@@ -6730,9 +6737,16 @@ def register_handlers(b: telebot.TeleBot) -> None:
                     markup = InlineKeyboardMarkup()
                     markup.add(InlineKeyboardButton("⬇️ Download", url=info["download"]))
 
-                    if size > AUTO_SEND_LIMIT:
+                    # A bot token tops out at 50MB; the user's own account reaches
+                    # 2GB, so the ceiling depends on whether they are logged in.
+                    has_userbot = bool(_get_user_credentials(uid))
+                    cap = USERBOT_UPLOAD_LIMIT if has_userbot else BOT_UPLOAD_LIMIT
+
+                    if size > cap:
+                        hint = ("" if has_userbot else
+                                "\n💡 <code>/login</code> raises this to 2GB.")
                         b.edit_message_text(
-                            head + f"\n\n⚠️ Over the {AUTO_SEND_LIMIT/MB:.0f}MB upload limit."
+                            head + f"\n\n⚠️ Over the {cap/MB:.0f}MB upload limit.{hint}"
                                    "\n📥 Tap the button below.",
                             message.chat.id, status.message_id,
                             parse_mode="HTML", reply_markup=markup)
@@ -6748,11 +6762,13 @@ def register_handlers(b: telebot.TeleBot) -> None:
                         message.chat.id, status.message_id, parse_mode="HTML")
                     try:
                         path = _download_to_tempfile_sync(
-                            info["download"], fname, timeout=300,
-                            max_bytes=AUTO_SEND_LIMIT, referer=None)
+                            info["download"], fname, timeout=600,
+                            max_bytes=cap, referer=None)
                     except FileTooLargeError:
+                        hint = ("" if has_userbot else
+                                "\n💡 <code>/login</code> raises this to 2GB.")
                         b.edit_message_text(
-                            head + f"\n\n⚠️ Bigger than {AUTO_SEND_LIMIT/MB:.0f}MB — too large to upload."
+                            head + f"\n\n⚠️ Bigger than {cap/MB:.0f}MB — too large to upload.{hint}"
                                    "\n📥 Tap the button below.",
                             message.chat.id, status.message_id,
                             parse_mode="HTML", reply_markup=markup)
@@ -6765,19 +6781,48 @@ def register_handlers(b: telebot.TeleBot) -> None:
                                             parse_mode="HTML", reply_markup=markup)
                         return
                     try:
-                        b.edit_message_text(f"📤 <b>Uploading to Telegram…</b>\n\n<code>{_esc(fname)}</code>",
-                                            message.chat.id, status.message_id, parse_mode="HTML")
-                        okay = _send_file_by_type(b, message.chat.id, path, fname, head,
-                                                  timeout=_send_timeout_for_size(size))
-                        if okay:
-                            increment_links(uid)
-                            save_history(uid, url, info)
-                            try: b.delete_message(message.chat.id, status.message_id)
-                            except Exception: pass
+                        real_size = os.path.getsize(path)
+                        if real_size <= BOT_UPLOAD_LIMIT:
+                            b.edit_message_text(
+                                f"📤 <b>Uploading to Telegram…</b>\n\n<code>{_esc(fname)}</code>",
+                                message.chat.id, status.message_id, parse_mode="HTML")
+                            okay = _send_file_by_type(b, message.chat.id, path, fname, head,
+                                                      timeout=_send_timeout_for_size(real_size))
+                            if okay:
+                                increment_links(uid)
+                                save_history(uid, url, info)
+                                try: b.delete_message(message.chat.id, status.message_id)
+                                except Exception: pass
+                            else:
+                                b.edit_message_text(head + "\n\n❌ Upload failed — use the button below.",
+                                                    message.chat.id, status.message_id,
+                                                    parse_mode="HTML", reply_markup=markup)
                         else:
-                            b.edit_message_text(head + "\n\n❌ Upload failed — use the button below.",
-                                                message.chat.id, status.message_id,
-                                                parse_mode="HTML", reply_markup=markup)
+                            # Too big for the bot token — hand it to the userbot.
+                            b.edit_message_text(
+                                f"📤 <b>Uploading via your account…</b>\n\n"
+                                f"<code>{_esc(fname)}</code>\n"
+                                f"📦 {human_size(real_size)}\n\n"
+                                f"<i>Over {BOT_UPLOAD_LIMIT/MB:.0f}MB, so it goes to your "
+                                f"Saved Messages.</i>",
+                                message.chat.id, status.message_id, parse_mode="HTML")
+                            ok_up, why = _run_async(
+                                _userbot_upload_file(uid, path, fname, head)
+                            ).result(timeout=3600)
+                            if ok_up:
+                                increment_links(uid)
+                                save_history(uid, url, info)
+                                b.edit_message_text(
+                                    head + f"\n\n✅ Sent to your <b>Saved Messages</b> "
+                                           f"({human_size(real_size)}).",
+                                    message.chat.id, status.message_id,
+                                    parse_mode="HTML", reply_markup=markup)
+                            else:
+                                b.edit_message_text(
+                                    head + f"\n\n❌ Userbot upload failed: <code>{_esc(why)}</code>"
+                                           "\n📥 Use the button below.",
+                                    message.chat.id, status.message_id,
+                                    parse_mode="HTML", reply_markup=markup)
                     finally:
                         _clean_file(path)
                 except Exception as e:
@@ -7472,6 +7517,57 @@ async def _admin_user_channels_task(admin_chat: int, status_msg_id: int, target_
                   f"\n📡 <b>Channels &amp; Groups</b> [{i+1}–{i+len(chunk)} of {len(rows)}]\n{body}")
 
 
+async def _userbot_upload_file(chat_id: int, file_path: str, filename: str,
+                               caption: str = "") -> tuple[bool, str]:
+    """Upload a file with the user's own account instead of the bot token.
+
+    A bot may only push 50 MB through the Bot API; the linked account talks
+    MTProto and reaches 2 GB. The userbot *is* the user, so it cannot post as
+    the bot into this chat — the file goes to their Saved Messages, which they
+    can open from any device.
+
+    Returns (ok, message_for_the_user).
+    """
+    creds = _get_user_credentials(chat_id)
+    if not creds:
+        return False, "no linked account"
+    api_id, api_hash, session_string = creds
+    if not session_string:
+        return False, "no session string stored"
+
+    client = None
+    try:
+        client = _make_task_client(
+            api_id, api_hash, f"up_{chat_id}",
+            session_string=session_string,
+            connection_retries=3, auto_reconnect=True,
+        )
+        await client.connect()
+        if not await client.is_user_authorized():
+            return False, "session expired — run /login again"
+
+        category, _ = _detect_file_category(filename)
+        kwargs = {
+            "caption": caption[:1024] if caption else "",
+            "parse_mode": "html",
+            "force_document": category not in ("video", "audio", "photo"),
+            "supports_streaming": category == "video",
+            "attributes": [tl_types.DocumentAttributeFilename(filename)],
+        }
+        # "me" is Saved Messages for the account that owns this session.
+        await client.send_file("me", file_path, **kwargs)
+        return True, "sent to Saved Messages"
+    except errors.FloodWaitError as e:
+        return False, f"Telegram asked to wait {e.seconds}s"
+    except Exception as e:
+        log.error(f"[userbot upload] {e}")
+        return False, str(e)
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 async def _list_chats_task(chat_id: int, status_msg_id: int) -> None:
     creds = _get_user_credentials(chat_id)
     if not creds:
