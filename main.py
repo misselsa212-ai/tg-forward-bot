@@ -1806,6 +1806,41 @@ def _filename_from_headers(url: str, headers) -> str:
     return _clean_name(name, 90)
 
 
+# mimetypes is inconsistent across Python builds for these, so pin the ones
+# that decide how Telegram renders the upload.
+_MIME_EXT_OVERRIDES = {
+    "video/mp4": ".mp4", "video/x-matroska": ".mkv", "video/quicktime": ".mov",
+    "video/webm": ".webm", "video/x-msvideo": ".avi", "video/mpeg": ".mpeg",
+    "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/ogg": ".ogg",
+    "audio/flac": ".flac", "audio/x-wav": ".wav", "audio/wav": ".wav",
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif",
+    "application/zip": ".zip", "application/x-7z-compressed": ".7z",
+    "application/vnd.rar": ".rar", "application/x-rar-compressed": ".rar",
+    "application/pdf": ".pdf",
+    "application/vnd.android.package-archive": ".apk",
+}
+
+
+def _ensure_extension(filename: str, content_type: str) -> str:
+    """Give an extensionless name one derived from Content-Type.
+
+    Hosts like FileDitch serve files under opaque names with no extension, and
+    without one _detect_file_category treats a video as a generic document, so
+    it uploads without a player.
+    """
+    if os.path.splitext(filename)[1]:
+        return filename
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if not ctype or ctype == "application/octet-stream":
+        return filename
+    ext = _MIME_EXT_OVERRIDES.get(ctype)
+    if not ext:
+        import mimetypes
+        ext = mimetypes.guess_extension(ctype) or ""
+    return f"{filename}{ext}" if ext else filename
+
+
 def probe_direct_link(url: str) -> dict:
     """Look up name / size / type without downloading the body.
 
@@ -1847,7 +1882,9 @@ def probe_direct_link(url: str) -> dict:
             size = int(cl)
 
         return {
-            "filename":   _filename_from_headers(str(resp.url), resp.headers),
+            "filename":   _ensure_extension(
+                              _filename_from_headers(str(resp.url), resp.headers),
+                              ctype),
             "size":       size,
             "size_human": human_size(size) if size else "Unknown",
             "download":   str(resp.url),
