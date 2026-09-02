@@ -7396,6 +7396,28 @@ async def _downloader_task(
     finally:
         job_clear(chat_id)
         await client.disconnect()  # type: ignore
+def _is_real_document(doc) -> bool:
+    """True only for genuine files (pdf/zip/apk/txt etc.).
+    Rejects stickers, GIFs/animations, videos, photos/images and audio
+    even when Telegram wraps them as MessageMediaDocument."""
+    mime = (getattr(doc, "mime_type", "") or "").lower()
+    for attr in getattr(doc, "attributes", []) or []:
+        if isinstance(attr, (tl_types.DocumentAttributeSticker,
+                             tl_types.DocumentAttributeAnimated,
+                             tl_types.DocumentAttributeVideo,
+                             tl_types.DocumentAttributeAudio,
+                             tl_types.DocumentAttributeImageSize)):
+            return False
+        if isinstance(attr, tl_types.DocumentAttributeFilename):
+            ext = os.path.splitext(getattr(attr, "file_name", "") or "")[1].lower()
+            if ext in (".gif", ".webp", ".tgs", ".webm", ".jpg", ".jpeg", ".png",
+                       ".mp4", ".mkv", ".mov", ".avi", ".mp3", ".ogg", ".m4a", ".flac"):
+                return False
+    if mime.startswith(("video/", "audio/", "image/")) or mime in ("application/x-tgsticker",):
+        return False
+    return True
+
+
 async def _dl_one_message(
     client, message, folder_name: str,
     dl_photo: bool, dl_video: bool, dl_audio: bool, dl_doc: bool,
@@ -7442,7 +7464,7 @@ async def _dl_one_message(
                 if os.path.exists(fp): return "skipped"
                 await client.download_media(message, file=fp)
                 return "audio"
-            if dl_doc:
+            if dl_doc and _is_real_document(media.document):
                 orig = "file"
                 for attr in getattr(media.document, "attributes", []):
                     if isinstance(attr, tl_types.DocumentAttributeFilename):
@@ -7578,7 +7600,7 @@ async def _forwarder_task(
                     ext  = ".ogg" if "ogg" in mime else ".mp3"
                     media_type = "audio"
                     dest_path  = os.path.join(user_fwd_cache, f"{mid}_audio{ext}")
-                elif fwd_doc:
+                elif fwd_doc and _is_real_document(doc):
                     orig = "file.bin"
                     for attr in getattr(doc, "attributes", []):
                         if isinstance(attr, tl_types.DocumentAttributeFilename):
