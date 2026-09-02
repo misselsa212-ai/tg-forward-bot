@@ -7731,214 +7731,208 @@ async def _forwarder_task(
         _bot_edit(chat_id, status_mid,
                   f"🔄 <b>Forwarding from {_esc(src_title)}…</b>\n{dedup_note}")
 
-        async for msg in client.iter_messages(src_entity, limit=limit, min_id=dst_min_id, reverse=True):  # type: ignore
+        # ALL mode (every media type ticked) also carries text-only posts so the
+        # destination mirrors the source post-for-post.
+        forward_text = fwd_photo and fwd_video and fwd_audio and fwd_doc
 
-            ctrl = await _check_job_control(chat_id, job_id)
-            if ctrl == "stop":
-                _bot_send(chat_id, "⏹ Forwarder stopped by user.")
-                dl_job_update(job_id, sent, failed + dl_errors, msg.id, "stopped", "stopped")
-                break
-
-            media = msg.media
-            if not media:
-                skipped += 1; continue
-
-            if is_msg_processed(src, msg.id, task_scope) or is_msg_processed(src, msg.id, "forward"):
-                skipped += 1; continue
-
-            media_type = dest_path = None
-            mid = f"id{msg.id}"
-
-            if fwd_photo and isinstance(media, tl_types.MessageMediaPhoto):
-                media_type = "photo"
-                dest_path  = os.path.join(user_fwd_cache, f"{mid}_photo.jpg")
-            elif isinstance(media, tl_types.MessageMediaDocument):
+        def _classify(m):
+            """(media_type, ext) under the active filters, or (None, None)."""
+            media = m.media
+            if isinstance(media, tl_types.MessageMediaPhoto):
+                return ("photo", ".jpg") if fwd_photo else (None, None)
+            if isinstance(media, tl_types.MessageMediaDocument):
                 doc  = media.document
                 mime = getattr(doc, "mime_type", "") or ""
                 if fwd_video and mime.startswith("video/"):
-                    media_type = "video"
-                    dest_path  = os.path.join(user_fwd_cache, f"{mid}_video.mp4")
-                elif fwd_audio and mime.startswith("audio/"):
-                    ext  = ".ogg" if "ogg" in mime else ".mp3"
-                    media_type = "audio"
-                    dest_path  = os.path.join(user_fwd_cache, f"{mid}_audio{ext}")
-                elif fwd_doc and _is_real_document(doc):
+                    return "video", ".mp4"
+                if fwd_audio and mime.startswith("audio/"):
+                    return "audio", (".ogg" if "ogg" in mime else ".mp3")
+                if fwd_doc and _is_real_document(doc):
                     orig = "file.bin"
                     for attr in getattr(doc, "attributes", []):
                         if isinstance(attr, tl_types.DocumentAttributeFilename):
                             orig = getattr(attr, "file_name", orig); break
-                    ext  = os.path.splitext(orig)[1] or ".bin"
-                    media_type = "document"
-                    dest_path  = os.path.join(user_fwd_cache, f"{mid}_doc{ext}")
+                    return "document", (os.path.splitext(orig)[1] or ".bin")
+            return None, None
 
-            if not media_type or not dest_path:
-                skipped += 1; continue
-
-            original_cap = msg.message or ""
+        def _caption_for(m) -> str:
+            original = m.message or ""
             if cap_mode == "clear":
-                caption = ""
-            elif cap_mode == "prefix":
-                caption = cap_prefix + original_cap
-            else:
-                caption = original_cap
+                return ""
+            if cap_mode == "prefix":
+                return cap_prefix + original
+            return original
 
-            forwarded_direct = False
+        def _attrs_for(m, media_type, path=None):
+            media = m.media
+            if not isinstance(media, tl_types.MessageMediaDocument):
+                return None
+            attrs = getattr(media.document, "attributes", []) or []
+            if media_type == "video":
+                for a in attrs:
+                    if isinstance(a, tl_types.DocumentAttributeVideo):
+                        return [tl_types.DocumentAttributeVideo(
+                            duration=int(a.duration or 0), w=int(a.w or 0), h=int(a.h or 0),
+                            supports_streaming=True)]
+                return [tl_types.DocumentAttributeVideo(duration=0, w=0, h=0, supports_streaming=True)] if path else None
+            if media_type == "audio":
+                for a in attrs:
+                    if isinstance(a, tl_types.DocumentAttributeAudio):
+                        return [tl_types.DocumentAttributeAudio(
+                            duration=int(a.duration or 0), performer=a.performer or "", title=a.title or "")]
+                return None
+            if media_type == "document":
+                for a in attrs:
+                    if isinstance(a, tl_types.DocumentAttributeFilename):
+                        return [tl_types.DocumentAttributeFilename(str(a.file_name))]
+                return [tl_types.DocumentAttributeFilename(os.path.basename(str(path)))] if path else None
+            return None
 
-            # ── PRIORITY 1: DIRECT FORWARD (ZERO DOWNLOAD) ────────────────────
-            if cap_mode in ("keep", "default", "none"):
+        async def _send_group(group) -> str:
+            """Forward one post: a single message or a whole album (same grouped_id).
+            Returns 'sent' | 'skipped' | 'failed' | 'dlerr'."""
+            items = [(m, mt, ext) for m in group for mt, ext in [_classify(m)] if mt]
+            keep = cap_mode in ("keep", "default", "none")
+
+            # ── Text-only post ────────────────────────────────────────────────
+            if not items:
+                if not (forward_text and not any(m.media for m in group)):
+                    return "skipped"
+                m = group[0]
+                text = _caption_for(m)
+                if not text.strip():
+                    return "skipped"
+                for attempt in range(3):
+                    try:
+                        if keep:
+                            try:
+                                await client.forward_messages(dst_entity, m)
+                                return "sent"
+                            except (errors.ChatForwardsRestrictedError, errors.ChatAdminRequiredError):
+                                pass
+                        await client.send_message(dst_entity, text,
+                                                  formatting_entities=m.entities if keep else None,
+                                                  link_preview=False)
+                        return "sent"
+                    except errors.FloodWaitError as e:
+                        await _flood_wait(e.seconds)
+                    except Exception as e:
+                        log.warning(f"[fwd text] attempt {attempt+1}: {e}")
+                        await asyncio.sleep(1)
+                return "failed"
+
+            msgs = [m for m, _, _ in items]
+            # An album carries its caption on one member; take the first non-empty one.
+            caption = next((_caption_for(m) for m in msgs if (m.message or "").strip()),
+                           _caption_for(msgs[0]))
+            album = len(msgs) > 1
+            captions = [caption] + [""] * (len(msgs) - 1)   # album caption shown once
+
+            # ── PRIORITY 1: DIRECT FORWARD (keeps the album grouped) ──────────
+            if keep:
+                for attempt in range(3):
+                    try:
+                        await client.forward_messages(dst_entity, msgs)
+                        return "sent"
+                    except errors.FloodWaitError as e:
+                        await _flood_wait(e.seconds)
+                    except (errors.ChatForwardsRestrictedError, errors.ChatAdminRequiredError):
+                        break
+                    except Exception as e:
+                        log.debug(f"[fwd direct] attempt {attempt+1}: {e}")
+                        await asyncio.sleep(1)
+
+            # ── PRIORITY 2: CLOUD RE-SEND (no download, album preserved) ──────
+            for attempt in range(3):
                 try:
-                    for attempt in range(3):
-                        try:
-                            await client.forward_messages(dst_entity, msg)
-                            forwarded_direct = True
-                            sent += 1
-                            mark_msg_processed(src, msg.id, task_scope)
-                            break
-                        except errors.FloodWaitError as e:
-                            await _flood_wait(e.seconds)
-                        except (errors.ChatForwardsRestrictedError, errors.ChatAdminRequiredError):
-                            break
-                        except Exception as e:
-                            log.debug(f"[fwd direct] attempt {attempt+1}: {e}")
-                            await asyncio.sleep(1)
-                except Exception:
-                    forwarded_direct = False
-
-            # ── PRIORITY 2: DIRECT CLOUD MEDIA SEND (ZERO DOWNLOAD) ───────────
-            if not forwarded_direct:
-                try:
-                    for attempt in range(3):
-                        try:
-                            if media_type == "photo":
-                                await client.send_file(dst_entity, msg.media, caption=caption, allow_cache=False)
-                            elif media_type == "video":
-                                duration = width = height = None
-                                if isinstance(media, tl_types.MessageMediaDocument):
-                                    for attr in getattr(media.document, "attributes", []):
-                                        if isinstance(attr, tl_types.DocumentAttributeVideo):
-                                            duration, width, height = attr.duration, attr.w, attr.h
-                                attrs = [tl_types.DocumentAttributeVideo(
-                                    duration=int(duration or 0),
-                                    w=int(width or 0), h=int(height or 0),
-                                    supports_streaming=True,
-                                )] if (duration or width or height) else None
-                                await client.send_file(dst_entity, msg.media, caption=caption, attributes=attrs, allow_cache=False)
-                            elif media_type == "audio":
-                                duration = performer = title_tag = None
-                                if isinstance(media, tl_types.MessageMediaDocument):
-                                    for attr in getattr(media.document, "attributes", []):
-                                        if isinstance(attr, tl_types.DocumentAttributeAudio):
-                                            duration, performer, title_tag = attr.duration, attr.performer, attr.title
-                                attrs = [tl_types.DocumentAttributeAudio(
-                                    duration=int(duration or 0),
-                                    performer=performer or "",
-                                    title=title_tag or "",
-                                )] if (duration or performer or title_tag) else None
-                                await client.send_file(dst_entity, msg.media, caption=caption, attributes=attrs, allow_cache=False)
-                            else:
-                                file_name = None
-                                if isinstance(media, tl_types.MessageMediaDocument):
-                                    for attr in getattr(media.document, "attributes", []):
-                                        if isinstance(attr, tl_types.DocumentAttributeFilename):
-                                            file_name = getattr(attr, "file_name", file_name)
-                                attrs = [tl_types.DocumentAttributeFilename(str(file_name))] if file_name else None
-                                await client.send_file(dst_entity, msg.media, caption=caption, attributes=attrs, allow_cache=False)
-
-                            forwarded_direct = True
-                            sent += 1
-                            mark_msg_processed(src, msg.id, task_scope)
-                            break
-                        except errors.FloodWaitError as e:
-                            await _flood_wait(e.seconds)
-                        except (errors.ChatForwardsRestrictedError, errors.MediaEmptyError):
-                            break
-                        except Exception as e:
-                            log.debug(f"[fwd cloud] attempt {attempt+1}: {e}")
-                            await asyncio.sleep(1)
-                except Exception:
-                    forwarded_direct = False
-
-            # ── PRIORITY 3: FALLBACK STREAMING DOWNLOAD (PROTECTED CONTENT) ───
-            if not forwarded_direct:
-                try:
-                    path = None
-                    for attempt in range(3):
-                        try:
-                            path = await client.download_media(msg, file=dest_path)
-                            break
-                        except errors.FloodWaitError as e:
-                            await _flood_wait(e.seconds)
-                        except Exception as e:
-                            log.warning(f"[fwd dl] attempt {attempt+1}: {e}")
-                            await asyncio.sleep(2)
-
-                    if path and os.path.exists(path):
-                        duration = width = height = performer = title_tag = file_name = None
-                        if isinstance(media, tl_types.MessageMediaDocument):
-                            for attr in getattr(media.document, "attributes", []):
-                                if isinstance(attr, tl_types.DocumentAttributeVideo):
-                                    duration, width, height = attr.duration, attr.w, attr.h
-                                elif isinstance(attr, tl_types.DocumentAttributeAudio):
-                                    duration, performer, title_tag = attr.duration, attr.performer, attr.title
-                                elif isinstance(attr, tl_types.DocumentAttributeFilename):
-                                    file_name = getattr(attr, "file_name", file_name)
-
-                        try:
-                            for attempt in range(3):
-                                try:
-                                    if media_type == "photo":
-                                        await client.send_file(dst_entity, path, caption=caption, allow_cache=False)
-                                    elif media_type == "video":
-                                        attrs = [tl_types.DocumentAttributeVideo(
-                                            duration=int(duration or 0),
-                                            w=int(width or 0), h=int(height or 0),
-                                            supports_streaming=True,
-                                        )]
-                                        await client.send_file(dst_entity, path,
-                                                               caption=caption, attributes=attrs,
-                                                               force_document=False, allow_cache=False)
-                                    elif media_type == "audio":
-                                        attrs = [tl_types.DocumentAttributeAudio(
-                                            duration=int(duration or 0),
-                                            performer=performer or "",
-                                            title=title_tag or "",
-                                        )]
-                                        await client.send_file(dst_entity, path,
-                                                               caption=caption, attributes=attrs, allow_cache=False)
-                                    else:
-                                        attrs = [tl_types.DocumentAttributeFilename(
-                                            str(file_name or os.path.basename(str(path)))
-                                        )]
-                                        await client.send_file(dst_entity, path,
-                                                               caption=caption, attributes=attrs, allow_cache=False)
-                                    sent += 1
-                                    mark_msg_processed(src, msg.id, task_scope)
-                                    break
-                                except errors.FloodWaitError as e:
-                                    await _flood_wait(e.seconds)
-                                except Exception as e:
-                                    log.warning(f"[fwd ul] Attempt {attempt+1} failed: {e}")
-                                    if isinstance(e, (errors.FilePartsInvalidError, ConnectionError, OSError)):
-                                        try:
-                                            await client.disconnect()
-                                            await asyncio.sleep(2)
-                                            await client.connect()
-                                        except Exception:
-                                            pass
-                                    if attempt == 2: raise
-                                    await asyncio.sleep(3)
-                        except Exception as e:
-                            log.error(f"[fwd ul] {e}"); failed += 1
-                        finally:
-                            if CLEAN_AFTER_SEND:
-                                _clean_file(str(path))
+                    if album:
+                        await client.send_file(dst_entity, [m.media for m in msgs],
+                                               caption=captions, allow_cache=False)
                     else:
-                        dl_errors += 1
+                        m, mt, _ = items[0]
+                        await client.send_file(dst_entity, m.media, caption=caption,
+                                               attributes=_attrs_for(m, mt), allow_cache=False)
+                    return "sent"
+                except errors.FloodWaitError as e:
+                    await _flood_wait(e.seconds)
+                except (errors.ChatForwardsRestrictedError, errors.MediaEmptyError):
+                    break
                 except Exception as e:
-                    log.error(f"[fwd dl fallback] {e}"); dl_errors += 1
+                    log.debug(f"[fwd cloud] attempt {attempt+1}: {e}")
+                    await asyncio.sleep(1)
 
+            # ── PRIORITY 3: DOWNLOAD + UPLOAD (protected content) ─────────────
+            paths: list[str] = []
+            for m, mt, ext in items:
+                dest = os.path.join(user_fwd_cache, f"id{m.id}_{mt}{ext}")
+                path = None
+                for attempt in range(3):
+                    try:
+                        path = await client.download_media(m, file=dest)
+                        break
+                    except errors.FloodWaitError as e:
+                        await _flood_wait(e.seconds)
+                    except Exception as e:
+                        log.warning(f"[fwd dl] attempt {attempt+1}: {e}")
+                        await asyncio.sleep(2)
+                if not path or not os.path.exists(str(path)):
+                    if CLEAN_AFTER_SEND:
+                        for p in paths: _clean_file(p)
+                    return "dlerr"
+                paths.append(str(path))
+
+            try:
+                for attempt in range(3):
+                    try:
+                        if album:
+                            await client.send_file(dst_entity, paths, caption=captions,
+                                                   supports_streaming=True, allow_cache=False)
+                        else:
+                            m, mt, _ = items[0]
+                            await client.send_file(dst_entity, paths[0], caption=caption,
+                                                   attributes=_attrs_for(m, mt, paths[0]),
+                                                   force_document=(mt == "document"),
+                                                   supports_streaming=(mt == "video"),
+                                                   allow_cache=False)
+                        return "sent"
+                    except errors.FloodWaitError as e:
+                        await _flood_wait(e.seconds)
+                    except Exception as e:
+                        log.warning(f"[fwd ul] attempt {attempt+1}: {e}")
+                        if isinstance(e, (errors.FilePartsInvalidError, ConnectionError, OSError)):
+                            try:
+                                await client.disconnect()
+                                await asyncio.sleep(2)
+                                await client.connect()
+                            except Exception:
+                                pass
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(3)
+            except Exception as e:
+                log.error(f"[fwd ul] {e}")
+                return "failed"
+            finally:
+                if CLEAN_AFTER_SEND:
+                    for p in paths: _clean_file(p)
+            return "failed"
+
+        async def _handle(group) -> None:
+            nonlocal sent, failed, dl_errors, skipped, processed
+            res = await _send_group(group)
+            if res == "sent":
+                sent += len(group)
+                for m in group:
+                    mark_msg_processed(src, m.id, task_scope)
+            elif res == "skipped":
+                skipped += len(group)
+            elif res == "dlerr":
+                dl_errors += 1
+            else:
+                failed += 1
             processed += 1
-            dl_job_update(job_id, sent, failed + dl_errors, msg.id, f"Msg {msg.id}")
+            last_id = group[-1].id
+            dl_job_update(job_id, sent, failed + dl_errors, last_id, f"Msg {last_id}")
             if processed % STATUS_UPDATE_INTERVAL == 0 and status_mid:
                 try:
                     _bot_edit(chat_id, status_mid,
@@ -7949,6 +7943,35 @@ async def _forwarder_task(
                               f"⏭ Skipped: <code>{skipped}</code>")
                 except Exception:
                     pass
+
+        # Messages of one album share grouped_id and arrive consecutively when
+        # iterating in ascending order, so buffer them and flush as one post.
+        pending: list = []
+        pending_gid = None
+
+        async for msg in client.iter_messages(src_entity, limit=limit, min_id=dst_min_id, reverse=True):  # type: ignore
+
+            ctrl = await _check_job_control(chat_id, job_id)
+            if ctrl == "stop":
+                if pending:
+                    await _handle(pending); pending = []
+                _bot_send(chat_id, "⏹ Forwarder stopped by user.")
+                dl_job_update(job_id, sent, failed + dl_errors, msg.id, "stopped", "stopped")
+                break
+
+            if is_msg_processed(src, msg.id, task_scope) or is_msg_processed(src, msg.id, "forward"):
+                skipped += 1; continue
+
+            gid = getattr(msg, "grouped_id", None)
+            if pending and (gid is None or gid != pending_gid):
+                await _handle(pending); pending = []
+            if gid is not None:
+                pending.append(msg); pending_gid = gid
+            else:
+                await _handle([msg])
+
+        if pending:
+            await _handle(pending)
 
         record["sent"] = total_ever + sent
         _save_forward_record(src_title, record)
