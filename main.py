@@ -1881,7 +1881,13 @@ def probe_direct_link(url: str) -> dict:
     resp = None
     try:
         resp = s.head(url, headers=hdrs, allow_redirects=True, timeout=20)
-        if resp.status_code >= 400 or not resp.headers.get("Content-Length"):
+        # Some hosts (e.g. FileDitch's CDN) mishandle HEAD and answer with an
+        # HTML placeholder page instead of the real file headers, while GET on
+        # the same URL streams the file fine. Confirm with GET before rejecting.
+        head_ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if (resp.status_code >= 400 or not resp.headers.get("Content-Length")
+                or head_ctype in ("text/html", "application/xhtml+xml")):
+            resp.close()
             resp = s.get(url, headers=hdrs, stream=True, allow_redirects=True, timeout=25)
     except Exception as e:
         raise RuntimeError(f"Could not reach the link: {_esc(str(e))}") from e
