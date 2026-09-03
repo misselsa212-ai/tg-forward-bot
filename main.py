@@ -88,6 +88,7 @@ KEY CHANGES vs v4:
 # STDLIB
 # ══════════════════════════════════════════════════════════════════════
 import asyncio
+import base64
 import concurrent.futures
 import json
 import logging
