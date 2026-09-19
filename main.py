@@ -7361,7 +7361,7 @@ def _resolve_channel(chat_id: int, text: str) -> tuple[str, str]:
 def run_bot() -> None:
     global bot
 
-    if BOT_TOKEN in ("YOUR_BOT_TOKEN", "", None):
+    if BOT_TOKEN in ("", ""):
         log.error("[Bot] BOT_TOKEN is a placeholder — set a real token.")
         return
 
