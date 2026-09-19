@@ -7424,7 +7424,7 @@ def run_bot() -> None:
             bot.polling(
                 non_stop=False,
                 timeout=90,           # Increased from 60
-                long_polling_timeout=60,  # Increased from 30
+                long_polling_timeout=90,  # Increased from 30
             )
             retry_count = 0  # Reset on success
         except apihelper.ApiTelegramException as e:
