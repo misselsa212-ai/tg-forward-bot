@@ -8159,6 +8159,8 @@ async def _scraper_task(
 
                     try:
                         sender = await rotator.get_next_client()
+                        sender_dst = await _ensure_joined(sender, dst)
+                        sender_dst_peer = await sender.get_input_entity(sender_dst)
                         thumb_url = info.get("thumb")
                         thumb  = await _download_thumb_async(session, thumb_url) if thumb_url else None
                         attrs  = [tl_types.DocumentAttributeVideo(
@@ -8179,7 +8181,7 @@ async def _scraper_task(
                         # Resilient upload with client reconnection on connection drop
                         for attempt in range(3):
                             try:
-                                await sender.send_file(dst_entity, filepath, **send_kwargs)
+                                await sender.send_file(sender_dst_peer, filepath, **send_kwargs)
                                 break
                             except errors.FloodWaitError as e:
                                 _bot_send(chat_id, f"⏳ FloodWait {e.seconds}s")
@@ -8218,6 +8220,8 @@ async def _scraper_task(
                 else:
                     try:
                         sender = await rotator.get_next_client()
+                        sender_dst = await _ensure_joined(sender, dst)
+                        sender_dst_peer = await sender.get_input_entity(sender_dst)
                         caption = (
                             f"From {channel_key}\n\nDownload: {download_url}\n"
                             f"\n\n[Open Download Link]({download_url})"
@@ -8230,7 +8234,7 @@ async def _scraper_task(
                         if streams:
                             caption += "   " + "  ".join(streams)
 
-                        await sender.send_message(dst_entity, caption, parse_mode="html")
+                        await sender.send_message(sender_dst_peer, caption, parse_mode="html")
                         done_count += 1
                         last_fn = filename
                         _update_scraper_status(found_count, done_count, failed_count, last_fn)
@@ -8587,6 +8591,8 @@ async def _forwarder_task(
         try:
             src_entity = await _ensure_joined(client, src)
             dst_entity = await _ensure_joined(client, dst)
+            src_peer   = await client.get_input_entity(src_entity)
+            dst_peer   = await client.get_input_entity(dst_entity)
             src_title  = getattr(src_entity, "title", None) or str(src)
         except Exception as e:
             _bot_send(chat_id, f"❌ Cannot resolve: <code>{_esc(str(e))}</code>")
@@ -8721,11 +8727,11 @@ async def _forwarder_task(
                     try:
                         if keep:
                             try:
-                                await client.forward_messages(dst_entity, m)
+                                await client.forward_messages(dst_peer, m, from_peer=src_peer)
                                 return "sent"
                             except (errors.ChatForwardsRestrictedError, errors.ChatAdminRequiredError):
                                 pass
-                        await client.send_message(dst_entity, text,
+                        await client.send_message(dst_peer, text,
                                                   formatting_entities=m.entities if keep else None,
                                                   link_preview=False)
                         return "sent"
@@ -8747,7 +8753,7 @@ async def _forwarder_task(
             if keep:
                 for attempt in range(3):
                     try:
-                        await client.forward_messages(dst_entity, msgs)
+                        await client.forward_messages(dst_peer, msgs, from_peer=src_peer)
                         return "sent"
                     except errors.FloodWaitError as e:
                         await _flood_wait(e.seconds)
@@ -8761,11 +8767,11 @@ async def _forwarder_task(
             for attempt in range(3):
                 try:
                     if album:
-                        await client.send_file(dst_entity, [m.media for m in msgs],
+                        await client.send_file(dst_peer, [m.media for m in msgs],
                                                caption=captions, allow_cache=False)
                     else:
                         m, mt, _ = items[0]
-                        await client.send_file(dst_entity, m.media, caption=caption,
+                        await client.send_file(dst_peer, m.media, caption=caption,
                                                attributes=_attrs_for(m, mt), allow_cache=False)
                     return "sent"
                 except errors.FloodWaitError as e:
@@ -8800,11 +8806,11 @@ async def _forwarder_task(
                 for attempt in range(3):
                     try:
                         if album:
-                            await client.send_file(dst_entity, paths, caption=captions,
+                            await client.send_file(dst_peer, paths, caption=captions,
                                                    supports_streaming=True, allow_cache=False)
                         else:
                             m, mt, _ = items[0]
-                            await client.send_file(dst_entity, paths[0], caption=caption,
+                            await client.send_file(dst_peer, paths[0], caption=caption,
                                                    attributes=_attrs_for(m, mt, paths[0]),
                                                    force_document=(mt == "document"),
                                                    supports_streaming=(mt == "video"),
