@@ -3654,7 +3654,8 @@ def _validate_bot_token(token: str, retries: int = 3) -> bool:
 
 
 def _make_bot() -> telebot.TeleBot:
-    return telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=MAX_BOT_THREADS)
+    # Keep polling exceptions in the main loop so a 409 stops this instance.
+    return telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 
 # ── Result card builders ──────────────────────────────────────────────
